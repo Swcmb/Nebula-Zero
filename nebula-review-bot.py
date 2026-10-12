@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from email.header import Header
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate
 
@@ -476,14 +477,22 @@ class Mailer:
         self.sender = sender or account
         self.use_ssl = use_ssl
 
-    def send(self, to_addr, subject, body):
+    def send(self, to_addr, subject, body, html_body=None):
         """new-api 的 common/email.go:44-71 对 465 端口走隐式 TLS（tls.Dial），
-        这里保持一致。"""
-        msg = MIMEText(body, "plain", "utf-8")
+        这里保持一致。
+
+        html_body 非空时用 multipart/alternative 同时挂纯文本与 HTML 两份，
+        收件端按能力挑：QQ 邮箱、Outlook、Gmail 都认，但各家默认样式差异
+        很大，所以 HTML 必须全部 inline 写死，不依赖 <style> 块（QQ 邮箱
+        会把它整个丢掉）。"""
+        msg = MIMEMultipart("alternative")
         msg["Subject"] = Header(subject, "utf-8")
         msg["From"] = formataddr((str(Header("Nebula-Zero", "utf-8")), self.sender))
         msg["To"] = to_addr
         msg["Date"] = formatdate(localtime=True)
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        if html_body:
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         if self.use_ssl:
             srv = smtplib.SMTP_SSL(self.host, self.port, timeout=25)
@@ -513,6 +522,8 @@ EMAIL_RE = re.compile(
 ***REMOVED*** 模板渲染出来是 "***REMOVED******REMOVED******REMOVED*** QQ号\n123456789" 这种形式（标记与值之间可能有换行），
 ***REMOVED*** 所以 \s* 必须能吃掉换行，否则标准模板反而提不出 QQ 号。
 QQ_RE = re.compile(r"(?:QQ|qq|扣扣)\s*(?:号)?\s*[:：]?\s*(\d{5,12})")
+***REMOVED*** 用户名只允许字母数字下划线连字符（new-api 的 Username 不接受别的）
+SAFE_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def parse_application(body):
@@ -547,6 +558,58 @@ def gen_password(length=16):
 
 
 ***REMOVED*** --------------------------------------------------------------------------
+***REMOVED*** 用户名策略
+***REMOVED*** --------------------------------------------------------------------------
+***REMOVED*** new-api 的 Username 上限是 20 个字符（model/user.go:81 的 validate:"max=20"），
+***REMOVED*** 而 "@example.edu" 光后缀就占 12 个 —— 完整邮箱当用户名时，只有本地部分
+***REMOVED*** 不超过 8 个字符的地址才能通过校验，Qufu师大的ID邮箱（26 字符）会在
+***REMOVED*** 审核环节静默失败。所以用户名统一取邮箱 @ 前面的部分，也就是ID或姓名拼音。
+***REMOVED***
+***REMOVED*** 补写 users.email 之后邮箱本身也能登录：model/user.go:1068 查的是
+***REMOVED*** "username = ? OR email = ?"，两个凭据都能用，邮件里会一并说明。
+USERNAME_MAX = 20
+
+
+def username_from_email(email, exists):
+    """按批准策略推导登录用户名。
+
+    exists(candidate) -> bool：候选名是否已被占用（含软删账号，因为
+    uni_users_username 是全表唯一索引，软删不释放名字）。
+
+    返回 (username, randomized) —— randomized 为 True 表示因为名字被占
+    或者本地部分超长而走了随机后缀，邮件里要额外说明。
+    """
+    local, _, _dom = email.partition("@")
+
+    def usable(name):
+        return 1 <= len(name) <= USERNAME_MAX and bool(SAFE_RE.fullmatch(name))
+
+    ***REMOVED*** 首选：本地部分原样。ID天然唯一，绝大多数人都能一次过。
+    if not exists(local) and usable(local):
+        return local, False
+
+    reason = "已被其他账号占用" if exists(local) else "长度超过 %d 字符" % USERNAME_MAX
+
+    ***REMOVED*** 降级：截前 6 个安全字符 + 随机后缀，总长 <= 11，撞名就重试。
+    prefix = "".join(c for c in local[:6] if SAFE_RE.match(c))[:6]
+    if prefix:
+        for _ in range(5):
+            cand = "%s-%s" % (prefix, "".join(
+                secrets.choice(string.ascii_lowercase + string.digits)
+                for _ in range(4)))
+            if not exists(cand):
+                return cand, True
+    ***REMOVED*** 前缀都造不出来（全是符号/中文）→ 只剩纯随机名。
+    for _ in range(5):
+        cand = "nz" + "".join(
+            secrets.choice(string.ascii_lowercase + string.digits)
+            for _ in range(6))
+        if not exists(cand):
+            return cand, True
+    return None, False
+
+
+***REMOVED*** --------------------------------------------------------------------------
 ***REMOVED*** 决定：管理员评论里带关键字
 ***REMOVED*** --------------------------------------------------------------------------
 APPROVE_WORDS = ("approve", "批准", "通过", "同意")
@@ -565,6 +628,200 @@ def decide(text):
     if any(w in t for w in APPROVE_WORDS):
         return "approve"
     return None
+
+
+QQ_CMD_RE = re.compile(r"^\s****REMOVED***?\s*(\d{1,5})\s*[:：\s,，、]?\s*(.+?)\s*$")
+
+
+def parse_qq_command(text):
+    """把管理员在 QQ 里发的一句话解析成 (issue_number, verdict)。
+
+    认得的写法（都要求消息里有单号，避免误触发）：
+        ***REMOVED***9 approve   /  ***REMOVED***9 批准   /  9 通过   /  ***REMOVED***9: reject   /  ***REMOVED***9 拒绝
+    后半段允许带客套话，例如「***REMOVED***9 approve 但是我觉得还是 reject」——按 decide()
+    的规则 reject 优先，不会因为句首的 approve 就误批。
+    返回 None 表示这不是一条指令（聊天、表情、别的闲聊都走这里）。
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 80:
+        return None
+    m = QQ_CMD_RE.match(t)
+    if not m:
+        return None
+    verdict = decide(m.group(2))
+    return (int(m.group(1)), verdict) if verdict else None
+
+
+class QQInbox:
+    """读 QQ 入站消息，作为审核指令的第二个入口。
+
+    管理员在手机上直接发「***REMOVED***9 approve」就能批准，不必去 GitHub 网页点评论，
+    而且 **Hermes 自己不会有任何回复** —— 这是 m07470 的明确要求。
+
+    两种数据后端，优先队列文件：
+
+    1. **队列文件**（首选，装了 hermes-plugin/nebula-qq-sink 时）
+       那个插件挂在 Hermes 的 ``pre_gateway_dispatch`` 钩子上，在消息到达
+       agent 之前就把「***REMOVED***N approve/reject」拦下来，写进一个 JSONL 队列并让
+       gateway 丢弃该消息 —— 所以 Hermes 既不回复也不写 state.db。机器人
+       只需跟着读这个文件的尾巴。
+
+    2. **state.db 只读**（没装插件时的兜底）
+       gateway 收到 QQ 消息后会把消息写进 sessions/messages 表，机器人以
+       只读方式读这张表。缺点是消息会继续走 agent，Hermes 会回一句废话，
+       所以只作为兼容保留。
+
+    两种后端都不做 WebSocket、不经过 LLM、不碰 Hermes 的写入逻辑。
+    """
+
+    def __init__(self, db_path, admin_openid, session_id, queue_path=None):
+        self.db = db_path
+        self.admin_openid = (admin_openid or "").upper()
+        self.session_id = session_id
+        self.queue = queue_path or ""
+        self.offset = 0
+        self.cursor = None
+        self.enabled = False
+        self.mode = ""
+        if self.queue:
+            try:
+                ***REMOVED*** 队列文件可能还不存在（插件还没拦到过消息），这不影响启用。
+                self.offset = os.path.getsize(self.queue) if os.path.exists(self.queue) else 0
+            except Exception as e:
+                LOG.warning("队列文件不可读，暂时退回 state.db 模式：%s", e)
+                self.queue = ""
+        if not self.queue:
+            if not os.path.exists(db_path):
+                LOG.warning("QQ 指令通道未启用：找不到 %s", db_path)
+                return
+            try:
+                self._open()
+            except Exception as e:
+                LOG.warning("QQ 指令通道初始化失败（不影响 GitHub 评论审核）：%s", e)
+                return
+            self.mode = "db"
+        else:
+            self.mode = "queue"
+        self.enabled = True
+        LOG.info("QQ 指令通道已启用（%s）",
+                 "队列文件 %s" % self.queue if self.mode == "queue"
+                 else "state.db 会话 %s" % (self.session_id or "自动定位"))
+
+    def _connect(self):
+        import sqlite3
+        ***REMOVED*** 只读打开：绝不能因为机器人的 bug 影响运行中的 Hermes。
+        uri = "file:%s?mode=ro&immutable=0" % self.db.replace("?", "%3f")
+        return sqlite3.connect(uri, uri=True, timeout=5)
+
+    def _open(self):
+        con = self._connect()
+        try:
+            if not self.session_id:
+                row = con.execute(
+                    "select id from sessions where source='qqbot' and "
+                    "(? = '' or user_id = ?) order by rowid desc limit 1",
+                    (self.admin_openid, self.admin_openid)).fetchone()
+                if not row:
+                    raise RuntimeError("state.db 里没有 qqbot 会话")
+                self.session_id = row[0]
+            ***REMOVED*** 只从"当前已有消息"之后开始读，避开历史闲聊与机器人自己的转发回执。
+            row = con.execute(
+                "select coalesce(max(id), 0) from messages where session_id=?",
+                (self.session_id,)).fetchone()
+            self.cursor = row[0] if row else 0
+        finally:
+            con.close()
+
+    def poll(self):
+        """返回 [(message_id, text), ...] —— 上次读取之后新增的 QQ 消息。"""
+        if not self.enabled:
+            return []
+        return self._poll_queue() if self.mode == "queue" else self._poll_db()
+
+    def _poll_queue(self):
+        """读插件写下的 JSONL 队列尾巴。
+
+        插件已经替我们做完了解析与鉴权，这里只把 ``text`` 原样交给
+        parse_qq_command 再判一次 —— 双保险，避免插件配置漂移时误判。
+        读不到就当没有，下一轮再看。
+        """
+        out = []
+        try:
+            size = os.path.getsize(self.queue)
+        except OSError:
+            return []
+        if size <= self.offset:
+            ***REMOVED*** 文件被截断/替换（不该发生），从新文件头开始，别漏指令。
+            if size < self.offset:
+                LOG.warning("QQ 指令队列变小（%d < %d），从头重读", size, self.offset)
+                self.offset = 0
+            else:
+                return []
+        try:
+            with open(self.queue, "r", encoding="utf-8") as fh:
+                fh.seek(self.offset)
+                blob = fh.read()
+        except OSError as e:
+            LOG.warning("读取 QQ 指令队列失败：%s", e)
+            return []
+        ***REMOVED*** 只消费到最后一个换行。插件正在往文件里 append 时，我们完全可能读到
+        ***REMOVED*** 半行 JSON；把这一截留在文件里等下一轮，否则既丢指令又刷无意义的
+        ***REMOVED*** "不是 JSON" 警告。
+        nl = blob.rfind("\n")
+        if nl < 0:
+            return []
+        blob, rest = blob[:nl + 1], blob[nl + 1:]
+        self.offset += len(blob.encode("utf-8"))
+        if rest.strip():
+            LOG.debug("QQ 指令队列尾部有半行未写完，本轮不消费（%d 字节）",
+                      len(rest.encode("utf-8")))
+        for idx, line in enumerate(blob.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                LOG.warning("QQ 指令队列第 %d 行不是 JSON，已跳过：%r", idx + 1, line[:80])
+                continue
+            text = rec.get("text") or ""
+            if not text:
+                continue
+            out.append((rec.get("message_id") or rec.get("ts") or self.offset, text))
+        return out
+
+    def _poll_db(self):
+        out = []
+        try:
+            con = self._connect()
+        except Exception as e:
+            LOG.warning("打开 state.db 失败：%s", e)
+            return []
+        try:
+            rows = con.execute(
+                "select id, content from messages "
+                "where session_id=? and role='user' and id > ? "
+                "and coalesce(platform_message_id,'') <> '' "
+                "order by id limit 20",
+                (self.session_id, self.cursor)).fetchall()
+            for mid, content in rows:
+                self.cursor = max(self.cursor, mid)
+                if content:
+                    out.append((mid, content))
+        except Exception as e:
+            LOG.warning("读取 QQ 消息失败：%s", e)
+        finally:
+            con.close()
+        return out
+
+    def rewind(self, message_id):
+        """把游标退回某条消息之前，让它能被重新解析（仅 state.db 模式）。
+
+        只改内存游标，不写库（state.db 是 Hermes 在用的，必须保持只读打开）。
+        队列模式是 append-only 的，逻辑上不存在回退，也没有任何调用点。
+        """
+        if self.mode == "db" and self.enabled and self.cursor and message_id < self.cursor:
+            self.cursor = message_id - 1
 
 
 ***REMOVED*** --------------------------------------------------------------------------
@@ -606,7 +863,8 @@ def finalize(gh, number, keep_note=""):
     LOG.info("***REMOVED***%d 锁定 → HTTP %s %s", number, code, "" if code in (204, 200) else data)
 
 
-def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
+def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
+           qq_inbox=None):
     """pre_existing=True 表示这条申请在机器人启动前就已存在。
 
     这种单子照样要进等待循环 —— 管理员可能已经回复了 approve，只是机器人在
@@ -641,7 +899,9 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
         "QQ号    : %s" % (user_qq or "（未填）"),
         "链接    : %s/issues/%d" % (cfg["repo_url"], number),
         "",
-        "处理方式：在该 issue 下回复含 approve 或 reject 的评论即可。",
+        "两种方式任选其一：",
+        "· 在本 QQ 里直接发「***REMOVED***%d approve」或「***REMOVED***%d reject」" % (number, number),
+        "· 或者去该 issue 下回复含 approve / reject 的评论。",
     ]
     if pre_existing:
         lines.insert(1, "（本单在机器人启动前已提交）")
@@ -650,7 +910,6 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
     ***REMOVED*** 等管理员决定
     LOG.info("***REMOVED***%d 已通知管理员，进入等待状态（每 %s 秒轮询一次）",
              number, cfg["poll_seconds"])
-
     ***REMOVED*** 只把机器人自己发的那条通知评论标记为已读，其余评论一律视为待处理。
     ***REMOVED*** 不能把进入循环时已存在的所有评论都标记已读 —— GitHub 通知有延迟，
     ***REMOVED*** 管理员完全可能在机器人发现 issue 之前就已经回复了 approve，
@@ -666,6 +925,25 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
                     exc_info=True)
     while True:
         time.sleep(cfg["poll_seconds"])
+
+        ***REMOVED*** ---- QQ 指令：管理员在手机上直接发「***REMOVED***N approve」即可，不必去网页 ----
+        ***REMOVED*** 先看 QQ，因为它是管理者最快的入口；单号对不上就退回游标等下一轮，
+        ***REMOVED*** 不会干扰下面 GitHub 评论的正常判定。
+        verdict = None
+        if qq_inbox is not None and qq_inbox.enabled:
+            for mid, text in qq_inbox.poll():
+                cmd = parse_qq_command(text)
+                if cmd is None:
+                    continue                      ***REMOVED*** 闲聊，不是指令
+                cmd_number, cmd_verdict = cmd
+                if cmd_number != number:
+                    LOG.info("忽略 QQ 指令 ***REMOVED***%d %s（当前等待的是 ***REMOVED***%d）",
+                             cmd_number, cmd_verdict, number)
+                    continue
+                LOG.info("***REMOVED***%d 收到 QQ 指令 → 判定 %s", number, cmd_verdict)
+                verdict = cmd_verdict
+                break
+
         try:
             issue_now = next((i for i in gh.issues("all", per_page=100)
                               if i["number"] == number), None)
@@ -680,34 +958,36 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
             LOG.info("***REMOVED***%d 已被管理员手动关闭，放弃跟踪", number)
             return
 
-        try:
-            comments = gh.issue_comments(number)
-        except Exception as e:
-            LOG.warning("拉取 ***REMOVED***%d 评论失败：%s", number, e)
-            continue
+        if verdict is None:
+            try:
+                comments = gh.issue_comments(number)
+            except Exception as e:
+                LOG.warning("拉取 ***REMOVED***%d 评论失败：%s", number, e)
+                continue
 
-        verdict = None
-        for c in comments:
-            if c["id"] in seen:
-                continue
-            seen.add(c["id"])
-            ***REMOVED*** 机器人自己的通知评论不算决策
-            if (c.get("user") or {}).get("login", "").endswith("[bot]"):
-                continue
-            verdict = decide(c.get("body"))
-            LOG.info("***REMOVED***%d 收到新评论（@%s）→ 判定 %s",
-                     number, (c.get("user") or {}).get("login", "?"), verdict or "无关键字")
-            if verdict:
-                break
+            for c in comments:
+                if c["id"] in seen:
+                    continue
+                seen.add(c["id"])
+                ***REMOVED*** 机器人自己的通知评论不算决策
+                if (c.get("user") or {}).get("login", "").endswith("[bot]"):
+                    continue
+                verdict = decide(c.get("body"))
+                LOG.info("***REMOVED***%d 收到新评论（@%s）→ 判定 %s",
+                         number, (c.get("user") or {}).get("login", "?"),
+                         verdict or "无关键字")
+                if verdict:
+                    break
 
         if not verdict:
             continue
 
         ***REMOVED*** ---- 决策落地 ----
         if verdict == "reject":
+            plain, rich = reject_email_body(cfg, title)
             try:
                 mailer.send(email, "【Nebula-Zero】您的开户申请未通过",
-                            reject_email_body(cfg, title))
+                            plain, rich)
                 LOG.info("***REMOVED***%d 拒绝邮件已发往 %s", number, email)
             except Exception as e:
                 LOG.error("***REMOVED***%d 拒绝邮件发送失败：%s", number, e)
@@ -717,59 +997,46 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
 
         ***REMOVED*** approve —— 先建号，再发信；建号失败绝不能发信，否则用户拿到的是无效账号
 
-        ***REMOVED*** 名字已经存在怎么办？两种情况要分开：
-        ***REMOVED***   · 账号还活着（deleted_at 为空）→ 直接把新密码发给本人，这是
-        ***REMOVED***     "重置密码"，member重复提交 issue 时最该发生的行为；
-        ***REMOVED***   · 账号已软删 → uni_users_username 是全表唯一约束，名字仍被占着，
-        ***REMOVED***     重新申请必然失败。此时给名字加一次性后缀，并在邮件里说明。
+        ***REMOVED*** 用户名已经被人占了怎么办？分三种：
+        ***REMOVED***   · 账号还活着（deleted_at 为空）→ 不重复建号，提示管理员手工重置密码
+        ***REMOVED***     （UpdateUser 需要 X-Security-Proof，机器人拿不到）；
+        ***REMOVED***   · 名字被软删账号占着，或本地部分超 20 字符 → 走随机后缀改名；
+        ***REMOVED***   · 随机 5 次仍撞名 → 放弃，让管理员手工建号。
+        ***REMOVED*** 查找要同时看邮箱和用户名：username_from_email 拿邮箱本地部分去查，
+        ***REMOVED*** 重复申请的人用哪个凭据登录都能命中。
         pw = gen_password()
-        LOG.info("***REMOVED***%d 批准，建号中：username=%s", number, email)
-        username = email            ***REMOVED*** 默认用户名就是邮箱本身
+        LOG.info("***REMOVED***%d 批准，建号中：email=%s", number, email)
+        exists = lambda cand: api.find_user_by_name(cand) is not None
+        username, randomized = username_from_email(email, exists)
+        if username is None:
+            LOG.error("***REMOVED***%d 无法为 %s 推导可用用户名（随机 5 次均撞名）", number, email)
+            qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 无法自动推导用户名（本地部分超长"
+                    "且随机名连续撞名），请手工建号。" % (number, email))
+            finalize(gh, number,
+                     "**结果：批准，但自动建号失败**\n\n"
+                     "邮箱 `%s` 的本地部分超过系统 20 字符上限，"
+                     "随机用户名又连续撞名，请管理员手工创建。" % email)
+            return
+
+        ***REMOVED*** 邮箱本身已经被一个活跃账号占着 → 不重复建号
         existing = api.find_user_by_name(email)
-        if existing is not None:
-            if not existing.get("DeletedAt"):
-                LOG.info("***REMOVED***%d 该邮箱已有活跃账号（id=%s），改为重置密码",
-                         number, existing.get("id"))
-                ***REMOVED*** UpdateUser 改密码需要 X-Security-Proof，机器人拿不到，
-                ***REMOVED*** 所以只能提示管理员手工处理，而不是假装成功。
-                qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 已有活跃账号（id=%s），"
-                        "本次申请不重复建号。\n如需重置密码，请手工在后台操作。"
-                        % (number, email, existing.get("id")))
-                finalize(gh, number,
-                         "**结果：该邮箱已开户**\n\n"
-                         "`%s` 已存在有效账号，本次申请未重复创建。\n\n"
-                         "如需重置密码，请联系管理员。" % email)
-                return
+        if existing is not None and not existing.get("DeletedAt"):
+            LOG.info("***REMOVED***%d 该邮箱已有活跃账号（id=%s），不重复建号",
+                     number, existing.get("id"))
+            qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 已有活跃账号（id=%s），"
+                    "本次申请不重复建号。\n如需重置密码，请手工在后台操作。"
+                    % (number, email, existing.get("id")))
+            finalize(gh, number,
+                     "**结果：该邮箱已开户**\n\n"
+                     "`%s` 已存在有效账号，本次申请未重复创建。\n\n"
+                     "如需重置密码，请联系管理员。" % email)
+            return
 
-            ***REMOVED*** 软删账号：名字还被占着，换一个新用户名重开。
-            ***REMOVED*** model/user.go:81 Username 是 validate:"max=20"，而registered邮箱
-            ***REMOVED*** "20231234567890@example.edu" 本身就 26 个字符，超长的申请人在
-            ***REMOVED*** 正常路径上就会失败 —— 候选链按长度从长到短试，都塞不下就放弃。
-            base, _, dom = email.partition("@")
-            for cand in ("%s+n%s@%s" % (base, number, dom),
-                         "%s+%s@%s" % (base, str(number)[:4], dom),
-                         "neb%d@%s" % (number, dom)):
-                if len(cand) <= 20:
-                    username = cand
-                    break
-            if username == email:
-                ***REMOVED*** 没有任何候选能压进 20 字符 —— 只能放弃，让管理员手工建号
-                LOG.error("***REMOVED***%d 原用户名 %s 已超 20 字符上限且无法改名",
-                          number, email)
-                qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 长度超过系统 20 字符上限，"
-                        "且该名字已被注销账号占用，无法自动建号，请手工处理。"
-                        % (number, email))
-                finalize(gh, number,
-                         "**结果：批准，但自动建号失败**\n\n"
-                         "邮箱 `%s` 已超过系统用户名 20 字符上限，"
-                         "且该名字被一个已注销的账号占用，请管理员手工创建。" % email)
-                return
-
-            LOG.warning("***REMOVED***%d %s 已被软删账号占用，改用 %s 重新开户",
-                        number, email, username)
-            qq.send("【Nebula-Zero】***REMOVED***%d 注意：%s 曾被一个已注销的账号占用，"
-                    "已改用 %s 作为新用户名（绑定邮箱仍是 %s）。"
-                    % (number, email, username, email))
+        if randomized:
+            LOG.warning("***REMOVED***%d 用户名改为随机：%s（邮箱 %s）", number, username, email)
+            qq.send("【Nebula-Zero】***REMOVED***%d 注意：%s 的登录用户名换成了 %s"
+                    "（本地部分过长或名字已被注销账号占用）。绑定邮箱不变。"
+                    % (number, email, username))
 
         code, data = api.create_user(
             username=username, password=pw, email=email,
@@ -806,8 +1073,8 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
                 LOG.exception("***REMOVED***%d 邮箱补写异常（已忽略，不影响开户）", number)
 
         try:
-            mailer.send(email, "【Nebula-Zero】您的账号已开通",
-                        approve_email_body(cfg, username, pw, email))
+            plain, rich = approve_email_body(cfg, username, pw, email, randomized)
+            mailer.send(email, "【Nebula-Zero】您的账号已开通", plain, rich)
             LOG.info("***REMOVED***%d 开户邮件已发往 %s", number, email)
             note = ("**结果：已通过**\n\n"
                     "已创建账号 `%s` 并向 %s 发送开户邮件（含初始密码）。"
@@ -827,31 +1094,80 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
         return
 
 
-def approve_email_body(cfg, username, password, email):
-    extra = ""
-    if username != email:
-        extra = ("\n注意：%s 曾被一个已注销的账号占用，"
-                 "因此你的登录用户名是下面这个，绑定邮箱仍是 %s。\n"
-                 % (email, email))
-    return (
+def approve_email_body(cfg, username, password, email, randomized=False):
+    site = cfg["site_url"]
+    note = ""
+    if randomized:
+        note = ("<table width='100%' cellpadding='0' cellspacing='0' "
+                "style='background:***REMOVED***fff7ed;border-left:4px solid ***REMOVED***f59e0b'>"
+                "<tr><td style='padding:12px 14px;font-size:13px;line-height:1.8;"
+                "color:***REMOVED***7c2d12'>你的邮箱 @ 前面的部分超过 {mx} 个字符，"
+                "或者这个名字已经被别的账号占用，所以登录用户名是 "
+                "<b style='font-family:Consolas,Menlo,monospace'>{un}</b>，"
+                "绑定邮箱仍然是 "
+                "<b style='font-family:Consolas,Menlo,monospace'>{em}</b>。"
+                "用它登录也可以。</td></tr></table>"
+                ).format(mx=USERNAME_MAX, un=_esc(username), em=_esc(email))
+
+    plain = (
         "%s 同学你好：\n\n"
         "你的 Nebula-Zero 账号已开通。\n\n"
         "登录地址 : %s\n"
         "用户名   : %s\n"
-        "初始密码 : %s\n%s\n"
+        "初始密码 : %s\n\n"
         "使用须知：\n"
         "  1. 首次登录后请立即在「个人设置」里修改密码。\n"
         "  2. 所有模型当前均为 0 元按量计费，你的账号额度不会因调用而扣减。\n"
-        "  3. 创建自己的 API Key 后即可调用，接口地址同为上述站点地址 + /v1。\n"
+        "  3. 创建自己的 API Key 后即可调用，接口地址见下方三种协议。\n"
         "  4. 上游为公开免费服务，偶发限流或临时不可用属正常现象，可稍后重试。\n\n"
         "如有任何问题，直接在本仓库开 issue 询问即可。\n\n"
         "—— Nebula-Zero 自动开户系统\n"
-        % (username, cfg["site_url"], username, password, extra)
+        % (username, site, username, password)
     )
+
+    def kv(label, value, mono=True):
+        fam = "font-family:Consolas,Menlo,monospace;font-size:15px;" if mono else ""
+        return ("<tr><td style='padding:9px 0;color:***REMOVED***64748b;font-size:13px;"
+                "width:88px;vertical-align:top'>{lb}</td>"
+                "<td style='padding:9px 0;color:***REMOVED***0f172a;{fam}"
+                "word-break:break-all'>{val}</td></tr>").format(
+                    lb=label, fam=fam, val=value)
+
+    html = _MAIL_SHELL.format(
+        title="您的账号已开通",
+        greeting="<p style='margin:0 0 16px 0;font-size:15px;line-height:1.8;"
+                 "color:***REMOVED***334155'>%s 同学你好，</p>"
+                 "<p style='margin:0 0 20px 0;font-size:15px;line-height:1.8;"
+                 "color:***REMOVED***334155'>你的 <b>Nebula-Zero</b> 账号已经开通了，"
+                 "下面是登录凭据和接入方式。</p>" % _esc(username),
+        creds=("<table width='100%' cellpadding='0' cellspacing='0' "
+              "style='background:***REMOVED***f8fafc;border:1px solid ***REMOVED***e2e8f0;"
+              "border-radius:8px'>{a}{b}{c}</table>").format(
+                  a=kv("登录地址", _esc(site)),
+                  b=kv("登录用户名", _esc(username)),
+                  c=kv("初始密码", _esc(password))),
+        note=note,
+        warn="<table width='100%' cellpadding='0' cellspacing='0' "
+             "style='background:***REMOVED***fef2f2;border-left:4px solid ***REMOVED***ef4444'>"
+             "<tr><td style='padding:12px 14px;font-size:13px;line-height:1.7;"
+             "color:***REMOVED***7f1d1d'><b>请注意</b>：首次登录后立刻在「个人设置」里"
+             "改掉这个初始密码。</td></tr></table>",
+        usage=_protocol_block(site) +
+              "<div style='font-size:13px;line-height:1.9;color:***REMOVED***334155;"
+              "margin-top:18px'>"
+              "<b>怎么用</b><br>"
+              "<b>1. 建 Key</b>：登录后在「API 密钥」里新建一个 Key。<br>"
+              "<b>2. 不扣额度</b>：全部模型当前 0 元按量计费，"
+              "调用不扣你的额度。<br>"
+              "<b>3. 上游偶发不可用</b>：上游是公开免费服务，"
+              "429 限流或 502 属正常现象，稍后重试即可。<br>"
+              "<b>4. 提问</b>：直接在本仓库开一个 issue 就行。</div>",
+    )
+    return plain, html
 
 
 def reject_email_body(cfg, title):
-    return (
+    plain = (
         "你好：\n\n"
         "很抱歉，你在 Nebula-Zero 提交的开户申请（%s）本次未能通过。\n\n"
         "常见原因：\n"
@@ -861,6 +1177,117 @@ def reject_email_body(cfg, title):
         "如果你认为这是误判，欢迎在原 issue 下补充说明，或直接重新提交一份申请。\n\n"
         "—— Nebula-Zero 自动开户系统\n" % title
     )
+    html = _MAIL_SHELL.format(
+        title="您的申请未通过",
+        greeting="<p style='margin:0 0 16px 0;font-size:15px;line-height:1.8;"
+                 "color:***REMOVED***334155'>你好，</p>"
+                 "<p style='margin:0 0 20px 0;font-size:15px;line-height:1.8;"
+                 "color:***REMOVED***334155'>很抱歉，你在 Nebula-Zero 提交的申请"
+                 "（%s）本次未能通过。</p>" % _esc(title),
+        creds="<table width='100%' cellpadding='0' cellspacing='0' "
+              "style='background:***REMOVED***fff7ed;border-left:4px solid ***REMOVED***f59e0b'>"
+              "<tr><td style='padding:12px 14px;font-size:13px;line-height:1.9;"
+              "color:***REMOVED***7c2d12'>常见原因：<br>"
+              "· 申请邮箱不属于本站允许的注册域名（仅限 example.edu）<br>"
+              "· 申请信息填写不完整<br>"
+              "· 申请提交频率过于频繁</td></tr></table>",
+        note="",
+        warn="",
+        usage="<p style='margin:0;font-size:13px;line-height:1.8;"
+              "color:***REMOVED***334155'>如果你认为这是误判，欢迎在原 issue 下"
+              "补充说明，或直接重新提交一份申请。</p>",
+    )
+    return plain, html
+
+
+def _protocol_block(site):
+    """三种协议的接入示例。Gemini 原生协议上游不支持，单独说明，
+    免得有人照着别处的教程填 /v1beta 结果拿到 404。"""
+    base = _esc(site)
+    rows = [
+        ("OpenAI 兼容（推荐）", "绝大多数客户端填这个",
+         'curl %s/v1/chat/completions \\\n'
+         '  -H "Authorization: Bearer 你的Key" \\\n'
+         '  -H "Content-Type: application/json" \\\n'
+         '  -d \'{"model":"big-pickle","messages":'
+         '[{"role":"user","content":"你好"}]}\'' % base),
+        ("Anthropic 兼容", "Claude 官方 SDK 可直接使用",
+         'curl %s/v1/messages \\\n'
+         '  -H "x-api-key: 你的Key" \\\n'
+         '  -H "anthropic-version: 2023-06-01" \\\n'
+         '  -H "Content-Type: application/json" \\\n'
+         '  -d \'{"model":"big-pickle","max_tokens":1024,'
+         '"messages":[{"role":"user","content":"你好"}]}\'' % base),
+        ("Responses 协议", "OpenAI 新版 Responses 接口",
+         'curl %s/v1/responses \\\n'
+         '  -H "Authorization: Bearer 你的Key" \\\n'
+         '  -H "Content-Type: application/json" \\\n'
+         '  -d \'{"model":"big-pickle","input":"你好"}\'' % base),
+    ]
+    out = []
+    for name, desc, code in rows:
+        out.append(
+            "<tr><td style='padding:14px 0 0 0'>"
+            "<div style='font-size:14px;color:***REMOVED***0f172a'><b>{nm}</b>"
+            "<span style='color:***REMOVED***94a3b8;font-size:12px'> · {ds}</span></div>"
+            "<pre style='margin:8px 0 0 0;padding:12px;background:***REMOVED***0f172a;"
+            "color:***REMOVED***e2e8f0;border-radius:6px;font-size:12px;line-height:1.6;"
+            "overflow-x:auto;word-break:break-all'>{cd}</pre></td></tr>"
+            .format(nm=name, ds=desc, cd=_esc(code)))
+    out.append(
+        "<tr><td style='padding:14px 0 0 0;font-size:12px;color:***REMOVED***64748b'>"
+        "Gemini 原生协议（/v1beta/…:generateContent）上游暂不支持，"
+        "需要该格式请走 OpenAI 兼容接口。</td></tr>")
+    return ("<table width='100%' cellpadding='0' cellspacing='0'>"
+            + "".join(out) + "</table>")
+
+
+def _esc(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+***REMOVED*** 邮件外壳：全部 inline 样式。QQ 邮箱会丢弃 <style> 块和部分 CSS，
+***REMOVED*** 所以配色、间距、内边距都写在内联属性上，靠 table 布局兜住各家客户端。
+***REMOVED***
+***REMOVED*** 用 str.format 的具名占位符而不是 %-格式化：这份模板里全是 CSS 的
+***REMOVED*** 百分号（width:100%），走 %-格式化每个都得写成 %%，漏一个就是
+***REMOVED*** TypeError 或整段样式错位 —— 调试时已经在这上面翻车好几次。
+***REMOVED*** 具名占位符对 % 完全免疫，少传一个会直接 KeyError，而不是静默错位。
+_MAIL_SHELL = (
+    "<!DOCTYPE html><html><body style='margin:0;padding:0;"
+    "background:***REMOVED***f1f5f9'>"
+    "<table width='100%' cellpadding='0' cellspacing='0' "
+    "style='background:***REMOVED***f1f5f9;padding:28px 12px'>"
+    "<tr><td align='center'>"
+    "<table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" "
+    "style=\"width:600px;max-width:100%;background:***REMOVED***ffffff;"
+    "border-radius:12px;overflow:hidden;font-family:'Segoe UI',"
+    "'PingFang SC','Microsoft YaHei',Arial,sans-serif\">"
+
+    "<tr><td style='background:***REMOVED***4f46e5;padding:26px 24px'>"
+    "<div style='color:***REMOVED***ffffff;font-size:19px;font-weight:600'>Nebula-Zero</div>"
+    "<div style='color:***REMOVED***c7d2fe;font-size:13px;margin-top:5px'>{title}</div>"
+    "</td></tr>"
+
+    "<tr><td style='padding:24px 24px 4px 24px'>{greeting}</td></tr>"
+    "<tr><td style='padding:12px 24px 0 24px'>{creds}</td></tr>"
+    "<tr><td style='padding:0 24px'>{note}</td></tr>"
+    "<tr><td style='padding:18px 24px 0 24px'>{warn}</td></tr>"
+    "<tr><td style='padding:22px 24px 22px 24px'>{usage}</td></tr>"
+
+    "<tr><td style='padding:26px 24px 22px 24px'>"
+    "<div style='border-top:1px solid ***REMOVED***e2e8f0;padding-top:16px;"
+    "font-size:12px;color:***REMOVED***94a3b8;line-height:1.8'>"
+    "本邮件由 Nebula-Zero 自动开户系统发出，请勿直接回复。<br>"
+    "本站只接受the organizationregistered邮箱（@example.edu）申请，"
+    "没有registered邮箱请先看 "
+    "<a href='https://net.example.edu' style='color:***REMOVED***4f46e5'>"
+    "the IT service portal的申请指引</a>。"
+    "</div></td></tr>"
+
+    "</table></td></tr></table></body></html>"
+)
 
 
 ***REMOVED*** --------------------------------------------------------------------------
@@ -896,6 +1323,29 @@ def main():
                           "/home/admin/.hermes/hermes-agent/.hermes/bin/hermes"),
                   conf.get("HERMES_ADMIN_USER", conf["NEWAPI_ADMIN_USER"]),
                   conf.get("QQ_HOME_CHANNEL", ""))
+
+    ***REMOVED*** QQ 指令通道：让管理员在手机上发「***REMOVED***N approve」就能批准，不必去 GitHub 网页。
+    ***REMOVED*** QQ 指令通道：优先读 hermes-plugin/nebula-qq-sink 写的队列文件（Hermes 保持
+    ***REMOVED*** 沉默）；没配队列时退回只读 Hermes 的 state.db。
+    qq_inbox = None
+    if conf.get("QQ_COMMAND", "true").lower() == "true":
+        admin_user = conf.get("HERMES_ADMIN_USER", conf["NEWAPI_ADMIN_USER"])
+        hermes_home = conf.get("HERMES_HOME", "/home/%s/.hermes" % admin_user)
+        queue_path = conf.get("QQ_COMMAND_QUEUE", "")
+        if queue_path:
+            parent = os.path.dirname(queue_path)
+            if parent and not os.access(parent, os.W_OK):
+                LOG.warning("QQ 指令队列目录 %s 对本进程不可写；机器人只读队列不受影响，"
+                            "但如果 gateway 也不是该目录的属主，QQ 审批会静默失效", parent)
+            if not os.path.exists(queue_path):
+                LOG.info("QQ 指令队列 %s 还不存在（插件尚未拦到过消息），按队列模式等待", queue_path)
+        qq_inbox = QQInbox(
+            conf.get("HERMES_STATE_DB", os.path.join(hermes_home, "state.db")),
+            conf.get("QQ_HOME_CHANNEL", ""),
+            conf.get("QQ_SESSION_ID", ""),
+            queue_path=queue_path)
+    else:
+        LOG.info("QQ 指令通道：已通过 QQ_COMMAND=false 关闭")
 
     ***REMOVED*** new-api 建号 API 落不了邮箱，靠这个补写。可用 BACKFILL_EMAIL=false 关掉。
     patcher = None
@@ -976,7 +1426,8 @@ def main():
                     continue
                 try:
                     handle(gh, api, mailer, qq, handle_conf, issue,
-                           pre_existing=first, patcher=patcher)
+                           pre_existing=first, patcher=patcher,
+                           qq_inbox=qq_inbox)
                 except Exception:
                     LOG.exception("处理 ***REMOVED***%d 时异常", n)
                 seen.add(n)

@@ -1,0 +1,9 @@
+name: nebula-qq-sink
+version: 1.0.0
+description: "Nebula-Zero 审核指令入口：在 QQ 里拦截「***REMOVED***N approve / ***REMOVED***N reject」这类消息，落到队列文件交给 nebula-review-bot 处理，并让 Hermes 本身保持沉默（不走 agent、不回复、不写 state.db）。只处理本目录 config.json 里列明的管理员 OpenID 与平台，其他消息一律放行。"
+author: Swcmb
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
+tags:
+  - nebula-zero

@@ -1,0 +1,9 @@
+{
+  "_comment": "nebula-qq-sink 插件配置。安装：把 nebula-qq-sink 目录放到 /home/admin/.hermes/plugins/ 下，重启 gateway。enabled=false 可随时停用。queue_file 必须在 gateway 属主（admin）可写的路径下 —— gateway 跑在 /root/.nebula-zero 写不进去，那里是 700 root。",
+  "enabled": true,
+  "platforms": ["qqbot"],
+  "admin_openids": ["在这里填管理员OpenID"],
+  "queue_file": "/home/admin/.hermes/nebula-zero/qq-commands.jsonl",
+  "require_mention_in_group": true,
+  "issue_range": [1, 100000]
+}
