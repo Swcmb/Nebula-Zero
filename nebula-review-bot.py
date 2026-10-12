@@ -27,6 +27,7 @@ Nebula-Zero member自助开户审核机器人
 """
 
 import argparse
+import http.cookiejar
 import json
 import logging
 import os
@@ -190,14 +191,111 @@ class GitHub:
 ***REMOVED*** new-api 客户端（建号）
 ***REMOVED*** --------------------------------------------------------------------------
 class NewAPI:
-    def __init__(self, base, admin_user, admin_pass):
+    """new-api 的 dashboard 客户端。
+
+    会话处理是这里唯一 tricky 的地方，机制全部来自源码：
+        service/auth_session.go:63  createLoginSession 每次登录都新建一条
+        user_sessions 记录，且 if activeCount >= common.UserSessionActiveLimit
+        就返回 AUTH_SESSION_LIMIT（默认 50，common/constants.go:46，
+        可用环境变量 USER_SESSION_ACTIVE_LIMIT 覆盖）。
+        会话寿命 LoginSessionTTL 实测恒为 30 天（expires_at - created_at
+        = 2592000），而 service/auth_cleanup.go 的清理任务只删「已过期」
+        和「已撤销」的，不删「活跃但闲置」的 —— 所以反复调 /api/user/login
+        会把自己的登录路慢慢堵死（实测撞过 HTTP 409 AUTH_SESSION_LIMIT）。
+
+    对策是走 refresh 而不是重登：
+        POST /api/user/auth/refresh（router/api-router.go:77）
+        契约见 controller/auth_session.go:17 RefreshAuth：
+            · refresh token 从 Cookie `new_api_refresh` 里取
+              （service/auth_session.go:16 RefreshCookieName）
+            · 可选 `X-Auth-Session` 头带 sid，不一致返回
+              ErrLoginSessionMismatch
+            · 成功返回 {"success":true,"data":{"access_token",...}}
+            · service.RefreshLoginSession 只轮换 refresh secret
+              （RotateUserSessionRefresh），不新建 user_sessions 行
+            · 没有 cookie 时返回 401 AUTH_UNAUTHORIZED
+        实测：带 cookie + X-Auth-Session 调一次，user_sessions 里活跃行数
+        不变，access_token 换新且能正常调 admin 接口。
+
+        登出是 POST /api/user/auth/logout（router/api-router.go:78）。
+        注意不是 /api/user/logout 或 /api/user/self/logout，那两个是 404。
+    """
+
+    def __init__(self, base, admin_user, admin_pass, session_file=None):
         self.base = base.rstrip("/")
         self.admin_user = admin_user
         self.admin_pass = admin_pass
         self.token = None
         self.user_id_header = None
+        self.user_id = None
+        self.sid = None
+        ***REMOVED*** cookie jar 让 refresh 用的 new_api_refresh 能跨请求留存
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        ***REMOVED*** 跨进程重启复用同一条会话，否则重启一次就 +1 条活跃会话
+        self.session_file = session_file
+        self._load_session()
 
-    def _req(self, method, path, body=None, timeout=25):
+    ***REMOVED*** ---- 会话持久化 -------------------------------------------------
+    def _load_session(self):
+        if not self.session_file or not os.path.exists(self.session_file):
+            return
+        try:
+            with open(self.session_file, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception as e:
+            LOG.warning("读取会话文件 %s 失败：%s", self.session_file, e)
+            return
+        if st.get("base") != self.base:
+            return
+        self.sid = st.get("sid")
+        self.user_id = st.get("user_id")
+        self.user_id_header = str(self.user_id or "")
+        for c in st.get("cookies") or []:
+            try:
+                self.jar.set_cookie(http.cookiejar.Cookie(
+                    version=0, name=c["name"], value=c["value"], port=None,
+                    port_specified=False, domain=c.get("domain", ""),
+                    domain_specified=True, domain_initial_dot=False,
+                    path=c.get("path", "/"), path_specified=True,
+                    secure=False, expires=c.get("expires"),
+                    discard=False, comment=None, comment_url=None,
+                    rest={}, rfc2109=False))
+            except Exception as e:
+                LOG.warning("恢复 cookie %s 失败：%s", c.get("name"), e)
+        LOG.info("复用已保存的会话 sid=%s", self.sid)
+
+    def _save_session(self):
+        if not self.session_file:
+            return
+        data = {
+            "base": self.base,
+            "sid": self.sid,
+            "user_id": self.user_id,
+            "cookies": [{"name": c.name, "value": c.value,
+                         "domain": c.domain, "path": c.path,
+                         "expires": c.expires} for c in self.jar],
+        }
+        tmp = self.session_file + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.session_file)
+        except Exception as e:
+            LOG.warning("写入会话文件 %s 失败：%s", self.session_file, e)
+
+    def _absorb(self, data):
+        """把登录/刷新响应里的 token 与 sid 收进来。"""
+        d = data.get("data") or {}
+        self.token = d.get("access_token")
+        self.user_id = (d.get("user") or {}).get("id") or d.get("id")
+        self.user_id_header = str(self.user_id or "")
+        self.sid = (d.get("session") or {}).get("sid") or self.sid
+        self._save_session()
+
+    def _req(self, method, path, body=None, timeout=25, extra=None):
         url = self.base + path
         data = None
         headers = {"Content-Type": "application/json"}
@@ -205,11 +303,13 @@ class NewAPI:
             headers["Authorization"] = "Bearer %s" % self.token
         if self.user_id_header:
             headers["New-Api-User"] = self.user_id_header
+        if extra:
+            headers.update(extra)
         if body is not None:
             data = json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self.opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
                 try:
                     return resp.status, json.loads(raw)
@@ -224,6 +324,28 @@ class NewAPI:
         except Exception as e:
             return 0, str(e)
 
+    def refresh(self):
+        """用已有会话换新的 access_token —— 不新建 user_sessions 行。
+
+        返回 True 表示 token 已刷新；False 表示没有可用会话或刷新失败，
+        调用方应退回 login()。
+        """
+        if not self.sid:
+            return False
+        code, data = self._req("POST", "/api/user/auth/refresh", None,
+                               extra={"X-Auth-Session": self.sid})
+        if code != 200 or not isinstance(data, dict) or not data.get("success"):
+            LOG.info("refresh 失败 HTTP %s：%s（退回重新登录）", code, data)
+            ***REMOVED*** 会话可能已被撤销/过期，清掉避免下次又走这条路
+            self.sid = None
+            self.token = None
+            self.jar.clear()
+            self._save_session()
+            return False
+        self._absorb(data)
+        LOG.info("已通过 refresh 换新 access_token（沿用会话 sid=%s）", self.sid)
+        return True
+
     def login(self):
         """POST /api/user/login —— 注意这个接口不带尾斜杠才正常。
 
@@ -233,24 +355,53 @@ class NewAPI:
                      "access_expires_at":..., "session":{...},
                      "user":{...}}}
         注意 data.id 不存在，用户 id 在 data.user.id。
+
+        409 AUTH_SESSION_LIMIT 的处置：new-api 给每个账号最多
+        common.UserSessionActiveLimit（默认 50，common/constants.go:46，可用环境变量
+        USER_SESSION_ACTIVE_LIMIT 覆盖）条「活跃会话」，而每次登录都新建一条
+        user_sessions 记录（service/auth_session.go:63 createLoginSession），
+        旧记录不因被新登录取代而撤销。机器人只要活过一天、每 30 秒轮询里
+        碰到一次 token 过期就重新登录，累积几十条后会把自己的登录路堵死
+        —— 实测撞到过 409，报错原文 `AUTH_SESSION_LIMIT`。
+
+        所以：
+          · 首选 refresh()（不新建会话行，也不受上限约束）；
+          · refresh 用不了才 login()；
+          · login 仍撞 409 时先登出旧会话再重试一次，仍不行才算真失败。
+        登出走 POST /api/user/auth/logout（router/api-router.go:78，注意不是
+        /api/user/logout 或 /api/user/self/logout，那两个是 404）。
         """
         code, data = self._req("POST", "/api/user/login", {
             "username": self.admin_user,
             "password": self.admin_pass,
         })
+        if code == 409 and isinstance(data, dict) and \
+                data.get("code") == "AUTH_SESSION_LIMIT":
+            LOG.warning("登录撞到会话上限（%s），先登出旧会话再重试一次", data.get("message"))
+            self._logout()
+            code, data = self._req("POST", "/api/user/login", {
+                "username": self.admin_user,
+                "password": self.admin_pass,
+            })
         if code != 200 or not isinstance(data, dict) or not data.get("success"):
             raise RuntimeError("管理员登录失败 HTTP %s: %s" % (code, data))
-        d = data.get("data") or {}
-        self.token = d.get("access_token")
-        self.user_id_header = str(
-            (d.get("user") or {}).get("id") or d.get("id") or "")
-        if not self.token:
+        if not (data.get("data") or {}).get("access_token"):
             raise RuntimeError("登录响应里没有 access_token")
-        LOG.info("new-api 登录成功（用户 id=%s）", self.user_id_header)
+        self._absorb(data)
+        LOG.info("new-api 登录成功（用户 id=%s，sid=%s）",
+                 self.user_id_header, self.sid)
 
     def ensure_token(self):
-        if not self.token:
-            self.login()
+        """拿一个可用的 access_token：refresh 优先，失败才重新登录。
+
+        这样机器人长期只占 1 条活跃会话，而不是每次 token 过期都 +1 条
+        30 天会话把自己撞进 AUTH_SESSION_LIMIT。
+        """
+        if self.token:
+            return
+        if self.refresh():
+            return
+        self.login()
 
     def create_user(self, username, password, email, quota, role=1):
         """POST /api/user/ —— 尾斜杠必须保留，否则 307。
@@ -278,10 +429,26 @@ class NewAPI:
         if code == 401 or (isinstance(data, dict) and
                            data.get("message") in ("无权进行此操作",
                                                    "AUTH_TOKEN_EXPIRED")):
-            LOG.info("access_token 可能过期，重新登录后重试一次")
-            self.login()
+            LOG.info("access_token 可能过期，refresh 或重新登录后重试一次")
+            self.token = None
+            self.ensure_token()
             code, data = self._req("POST", "/api/user/", body)
         return code, data
+
+    def _logout(self):
+        """用当前 access_token 登出，把这条 user_sessions 记录撤销掉。
+
+        失败无所谓 —— 那说明这条会话本来就是过期的，占用照旧，只能靠 DB 清理。
+        """
+        if not self.token:
+            return
+        code, data = self._req("POST", "/api/user/auth/logout", None)
+        LOG.info("登出旧会话 → HTTP %s", code)
+        self.token = None
+        self.user_id_header = str(self.user_id or "")
+        self.sid = None
+        self.jar.clear()
+        self._save_session()
 
     def find_user_by_name(self, username):
         """按用户名查是否存在账号（含软删行）。找不到返回 None。
@@ -989,9 +1156,17 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
                 mailer.send(email, "【Nebula-Zero】您的开户申请未通过",
                             plain, rich)
                 LOG.info("***REMOVED***%d 拒绝邮件已发往 %s", number, email)
+                ***REMOVED*** 管理员在 QQ 里下的指令，处置结果必须回到 QQ —— 否则他只能
+                ***REMOVED*** 去 GitHub 看 issue 才知道跑没跑完。
+                qq.send("【Nebula-Zero】***REMOVED***%d 已拒绝（未创建账号）\n"
+                        "申请人邮箱：%s\n"
+                        "拒绝通知邮件已发出，issue 已关闭并锁定。"
+                        % (number, email))
             except Exception as e:
                 LOG.error("***REMOVED***%d 拒绝邮件发送失败：%s", number, e)
-                qq.send("【Nebula-Zero】***REMOVED***%d 拒绝邮件发送失败：%s" % (number, e))
+                qq.send("【Nebula-Zero】***REMOVED***%d 已拒绝（未创建账号），但拒绝邮件发送失败：%s\n"
+                        "申请人邮箱：%s，请手工告知结果。\nissue 已关闭并锁定。"
+                        % (number, e, email))
             finalize(gh, number, "**结果：未通过**\n\n已向 %s 发送结果通知邮件。" % email)
             return
 
@@ -1010,8 +1185,10 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
         username, randomized = username_from_email(email, exists)
         if username is None:
             LOG.error("***REMOVED***%d 无法为 %s 推导可用用户名（随机 5 次均撞名）", number, email)
-            qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 无法自动推导用户名（本地部分超长"
-                    "且随机名连续撞名），请手工建号。" % (number, email))
+            qq.send("【Nebula-Zero】***REMOVED***%d 批准但**未创建账号**\n"
+                    "申请人邮箱：%s\n"
+                    "原因：邮箱本地部分超 20 字符上限，随机用户名又连续撞名，需手工建号。\n"
+                    "issue 已关闭并锁定。" % (number, email))
             finalize(gh, number,
                      "**结果：批准，但自动建号失败**\n\n"
                      "邮箱 `%s` 的本地部分超过系统 20 字符上限，"
@@ -1023,9 +1200,11 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
         if existing is not None and not existing.get("DeletedAt"):
             LOG.info("***REMOVED***%d 该邮箱已有活跃账号（id=%s），不重复建号",
                      number, existing.get("id"))
-            qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 已有活跃账号（id=%s），"
-                    "本次申请不重复建号。\n如需重置密码，请手工在后台操作。"
-                    % (number, email, existing.get("id")))
+            qq.send("【Nebula-Zero】***REMOVED***%d 批准但**未创建新账号**\n"
+                    "申请人邮箱：%s\n"
+                    "该邮箱已有活跃账号（id=%s），本次申请不重复建号。\n"
+                    "如需重置密码，请手工在后台操作。\n"
+                    "issue 已关闭并锁定。" % (number, email, existing.get("id")))
             finalize(gh, number,
                      "**结果：该邮箱已开户**\n\n"
                      "`%s` 已存在有效账号，本次申请未重复创建。\n\n"
@@ -1034,9 +1213,10 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
 
         if randomized:
             LOG.warning("***REMOVED***%d 用户名改为随机：%s（邮箱 %s）", number, username, email)
-            qq.send("【Nebula-Zero】***REMOVED***%d 注意：%s 的登录用户名换成了 %s"
-                    "（本地部分过长或名字已被注销账号占用）。绑定邮箱不变。"
-                    % (number, email, username))
+            ***REMOVED*** 改名只是提示，真正的处置回执在后面统一发。
+            qq.send("【Nebula-Zero】***REMOVED***%d 提示：登录用户名改为 %s\n"
+                    "（邮箱 %s 的本地部分过长，或该名字已被注销账号占用）。绑定邮箱不变。"
+                    % (number, username, email))
 
         code, data = api.create_user(
             username=username, password=pw, email=email,
@@ -1046,8 +1226,11 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
         if code not in (200, 201) or (isinstance(data, dict) and
                                       data.get("success") is False):
             LOG.error("***REMOVED***%d 建号失败 HTTP %s: %s", number, code, data)
-            qq.send("【Nebula-Zero】***REMOVED***%d 建号失败 HTTP %s，请人工处理：%s"
-                    % (number, code, data))
+            qq.send("【Nebula-Zero】***REMOVED***%d 批准但**未创建账号**\n"
+                    "申请人邮箱：%s\n"
+                    "原因：new-api 建号接口返回 HTTP %s `%s`，请人工处理。\n"
+                    "（未发开户邮件 —— 避免用户拿到无效账号。）\n"
+                    "issue 已关闭并锁定。" % (number, email, code, data))
             finalize(gh, number,
                      "**结果：批准，但自动建号失败**\n\n"
                      "错误：`HTTP %s` `%s`\n\n管理员已收到告警，请手工创建账号。"
@@ -1066,8 +1249,11 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
                     LOG.info("***REMOVED***%d 邮箱已补写入库：%s", number, detail)
                 else:
                     LOG.warning("***REMOVED***%d 邮箱补写失败：%s", number, detail)
-                    qq.send("【Nebula-Zero】***REMOVED***%d 账号已创建，但 users.email 补写失败：%s\n"
-                            "用户名 %s 仍可正常登录，只是收不到系统通知邮件。"
+                    ***REMOVED*** 补写失败不影响开户（账号已建、邮件照发），这里只提醒管理员
+                    ***REMOVED*** 邮箱列空着会导致日后给他发系统通知邮件投不出去。
+                    qq.send("【Nebula-Zero】***REMOVED***%d 小提醒：users.email 补写失败（%s）\n"
+                            "账号 %s 已正常创建并开户，只是邮箱列没落上，"
+                            "日后系统通知邮件可能投不出去。不影响本次流程。"
                             % (number, detail, username))
             except Exception:
                 LOG.exception("***REMOVED***%d 邮箱补写异常（已忽略，不影响开户）", number)
@@ -1079,12 +1265,24 @@ def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None,
             note = ("**结果：已通过**\n\n"
                     "已创建账号 `%s` 并向 %s 发送开户邮件（含初始密码）。"
                     % (username, email))
+            ***REMOVED*** 账号已建且邮件已发 —— 这是最该回报的一条，密码同时发到 QQ 兜底，
+            ***REMOVED*** 免得邮件进了垃圾箱就彻底找不回来了。
+            qq.send("【Nebula-Zero】***REMOVED***%d 已通过，账号创建成功\n"
+                    "申请人邮箱：%s\n"
+                    "登录用户名：%s\n"
+                    "初始密码：%s\n"
+                    "开户邮件已发出，issue 已关闭并锁定。"
+                    "\n提醒本人首次登录后立刻改密码。"
+                    % (number, email, username, pw))
         except Exception as e:
             LOG.error("***REMOVED***%d 开户邮件发送失败：%s", number, e)
             ***REMOVED*** 账号已建但邮件没发出去——必须告诉管理员密码，否则用户永远拿不到
-            qq.send("【Nebula-Zero】***REMOVED***%d 账号已创建但邮件发送失败：%s\n"
-                    "用户名 %s，初始密码 %s —— 请手工把凭据发给申请人。"
-                    % (number, e, username, pw))
+            qq.send("【Nebula-Zero】***REMOVED***%d 账号**已创建**但开户邮件发送失败：%s\n"
+                    "申请人邮箱：%s\n"
+                    "登录用户名：%s\n"
+                    "初始密码：%s\n"
+                    "请手工把凭据发给申请人。issue 已关闭并锁定。"
+                    % (number, e, email, username, pw))
             note = ("**结果：已通过，但邮件发送失败**\n\n"
                     "账号已创建（用户名 `%s`），但通知邮件未能送达。\n\n"
                     "管理员已收到含初始密码的告警，请手工转发凭据。"
@@ -1315,7 +1513,9 @@ def main():
     gh = GitHub(conf["GITHUB_TOKEN"], conf["GITHUB_REPO"],
                  conf.get("GITHUB_API", "https://api.github.com"))
     api = NewAPI(conf["NEWAPI_BASE"], conf["NEWAPI_ADMIN_USER"],
-                 conf["NEWAPI_ADMIN_PASS"])
+                 conf["NEWAPI_ADMIN_PASS"],
+                 session_file=os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                                           ".bot_session.json"))
     mailer = Mailer(conf["SMTP_HOST"], conf["SMTP_PORT"], conf["SMTP_ACCOUNT"],
                     conf["SMTP_TOKEN"], conf.get("SMTP_FROM") or conf["SMTP_ACCOUNT"],
                     use_ssl=conf.get("SMTP_SSL", "true").lower() == "true")
@@ -1414,11 +1614,17 @@ def main():
             LOG.warning("写入 %s 失败：%s", seen_file, e)
 
     first = True
+    ***REMOVED*** 崩溃的 issue 不进 seen，但要退避重试 —— 否则一次网络抖动就永久漏掉一个申请。
+    ***REMOVED*** 10 分钟退避是为了别在每轮 30s 里把 QQ 通知刷爆。
+    retry_after = {}
+    RETRY_SECONDS = 600
     while not stopping["v"]:
         try:
             for issue in gh.issues("open", per_page=100):
                 n = issue["number"]
                 if n in seen:
+                    continue
+                if retry_after.get(n, 0) > time.time():
                     continue
                 body = issue.get("body") or ""
                 if TEMPLATE_MARK not in body:
@@ -1429,7 +1635,12 @@ def main():
                            pre_existing=first, patcher=patcher,
                            qq_inbox=qq_inbox)
                 except Exception:
-                    LOG.exception("处理 ***REMOVED***%d 时异常", n)
+                    LOG.exception("处理 ***REMOVED***%d 时异常，%.0f 分钟后重试",
+                                  n, RETRY_SECONDS / 60.0)
+                    retry_after[n] = time.time() + RETRY_SECONDS
+                    persist()
+                    continue
+                retry_after.pop(n, None)
                 seen.add(n)
                 persist()
             first = False
