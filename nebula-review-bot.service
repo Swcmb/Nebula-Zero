@@ -1,0 +1,33 @@
+[Unit]
+Description=Nebula-Zero 开户审核机器人
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+***REMOVED*** 配置与脚本分开放，改配置不用重启脚本本体
+ExecStart=/usr/bin/python3 /opt/nebula-zero/nebula-review-bot.py -c /root/.nebula-zero/bot.env
+Restart=always
+RestartSec=15
+***REMOVED*** 机器人会处理"关闭 issue"这类不可逆动作，给足缓冲避免反复重启造成半途状态
+TimeoutStopSec=30
+
+***REMOVED*** ---- 安全加固：除了读配置，不该碰到别的东西 ----
+User=root
+Group=root
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/root/.nebula-zero
+***REMOVED*** 出网只需要这几个（按需调整，评论掉不需要的行）
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+***REMOVED*** 日志走 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nebula-review-bot
+
+[Install]
+WantedBy=multi-user.target

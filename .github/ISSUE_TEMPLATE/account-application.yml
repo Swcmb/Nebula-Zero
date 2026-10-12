@@ -1,0 +1,69 @@
+name: 账号申请
+description: 申请 Nebula Zero 的模型调用账号（仅限the organizationregistered邮箱）
+title: "[申请] ID/姓名 - registered邮箱"
+labels: ["申请"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢申请 Nebula Zero 的模型调用账号。
+
+        **提交前请确认：**
+        1. 你已用 `@example.edu` registered邮箱在本平台注册过基础账号
+        2. 你的registered邮箱能正常接收邮件（记得看垃圾箱）
+        3. 本账号仅供本人学习研究使用，请勿用于商业用途或对外提供服务
+
+        管理员会在审核后通过本 issue 告知结果，账号信息将发到你的registered邮箱。
+
+  - type: input
+    id: name
+    attributes:
+      label: 姓名
+      placeholder: 张三
+    validations:
+      required: true
+
+  - type: input
+    id: student-id
+    attributes:
+      label: ID
+      placeholder: 2023010101
+    validations:
+      required: true
+
+  - type: input
+    id: email
+    attributes:
+      label: registered邮箱
+      description: 仅接受 @example.edu 结尾的邮箱
+      placeholder: 2023010101@example.edu
+    validations:
+      required: true
+
+  - type: input
+    id: qq
+    attributes:
+      label: QQ号
+      description: 用于管理员审核时联系你，不会公开
+      placeholder: 123456789
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: 使用场景
+      description: 简单说明你的用途，例如课程作业、毕业设计、个人学习
+      placeholder: 毕业设计需要调用 LLM 做数据分析...
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: agreement
+    attributes:
+      label: 承诺
+      options:
+        - label: 我已阅读并同意本项目的行为规范，不会将本服务用于商业用途或对外转售
+          required: true
+
+<!-- application-template: account-application -->

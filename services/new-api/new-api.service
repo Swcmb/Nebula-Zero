@@ -1,0 +1,18 @@
+***REMOVED*** File path: /etc/systemd/system/new-api.service
+***REMOVED*** sudo systemctl daemon-reload
+***REMOVED*** sudo systemctl start new-api
+***REMOVED*** sudo systemctl enable new-api
+***REMOVED*** sudo systemctl status new-api
+[Unit]
+Description=One API Service
+After=network.target
+
+[Service]
+User=ubuntu  ***REMOVED*** 注意修改用户名
+WorkingDirectory=/path/to/new-api  ***REMOVED*** 注意修改路径
+ExecStart=/path/to/new-api/new-api --port 3000 --log-dir /path/to/new-api/logs  ***REMOVED*** 注意修改路径和端口号
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

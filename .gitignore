@@ -1,0 +1,28 @@
+﻿***REMOVED*** 密钥与运行时数据
+deploy/.env
+*.env.local
+nebula-review-bot.env.local
+
+***REMOVED*** 运行时产物
+deploy/data/
+deploy/logs/
+*.log
+
+***REMOVED*** 上游快照的构建产物
+services/new-api/web/node_modules/
+services/new-api/web/dist/
+services/new-api/bin/
+services/opencode2api/opencode2api
+services/opencode2api/dist/
+
+***REMOVED*** 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+***REMOVED*** 意外混入的密钥文件（兜底）
+.env
+*.pem
+*.key
+id_rsa*

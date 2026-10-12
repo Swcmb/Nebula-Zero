@@ -1,0 +1,91 @@
+***REMOVED*** Nebula Zero 部署编排
+***REMOVED***
+***REMOVED*** 用法：
+***REMOVED***   cp deploy/.env.example deploy/.env   ***REMOVED*** 填入自己的密钥
+***REMOVED***   docker compose -f deploy/docker-compose.yml up -d
+***REMOVED***
+***REMOVED*** 本文件是脱敏后的生产配置模板：所有密码/密钥均为占位符，
+***REMOVED*** 真实值只存在于服务器的 .env，不进版本库。
+
+services:
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: always
+    command: --log-dir /app/logs
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    environment:
+      - SQL_DSN=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/new-api
+      - REDIS_CONN_STRING=redis://redis
+      - SESSION_SECRET=${SESSION_SECRET}
+      - CRYPTO_SECRET=${CRYPTO_SECRET}
+      - TZ=${TZ:-Asia/Shanghai}
+      - ERROR_LOG_ENABLED=true
+      - BATCH_UPDATE_ENABLED=true
+      - SYNC_FREQUENCY=60
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: new-api
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=100
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d new-api']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ***REMOVED*** 上游适配器，4 实例轮询：单实例在实测中频繁 429/502，不可压容。
+  ***REMOVED*** 省略其余 3 个实例，按同一模式复制。
+  oc2api-1:
+    image: ghcr.io/jasonxu114514/opencode2api:latest
+    container_name: oc2api-1
+    restart: always
+    ports:
+      - '127.0.0.1:8080:8080'
+    environment:
+      - OC2API_KEY=${OC2API_KEY}
+      - TZ=${TZ:-Asia/Shanghai}
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O - http://localhost:8080/healthz || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  pg_data:
