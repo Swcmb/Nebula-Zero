@@ -428,19 +428,39 @@ class QQNotify:
 
     def _deliver(self, text):
         import subprocess
+        import tempfile
         env = dict(os.environ)
         env["HOME"] = "/home/%s" % self.admin_user
         env["XDG_RUNTIME_DIR"] = "/run/user/%d" % self.uid
-        ***REMOVED*** -t qqbot 走 home channel；openid 只用于日志核对，不参与路由。
-        proc = subprocess.run(
-            ["/usr/bin/sudo", "-n", "-u", self.admin_user,
-             self.hermes, "send", "-t", "qqbot", "-q", text],
-            capture_output=True, text=True, timeout=60, env=env)
+        ***REMOVED*** 消息体走临时文件而不是 argv：issue 标题可能很长，argv 有长度上限；
+        ***REMOVED*** 写文件也让 systemd 日志里的换行显示得清楚些。
+        fd, path = tempfile.mkstemp(prefix="nebula-qq-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            ***REMOVED*** 消息里含邮箱和初始密码，权限按属主收紧；但必须归到 Hermes 的
+            ***REMOVED*** 属主名下，否则 sudo -u 切过去之后读不到
+            ***REMOVED*** （Errno 13 Permission denied）。
+            os.chown(path, self.uid, self.uid)
+            os.chmod(path, 0o600)
+            ***REMOVED*** -t qqbot 走 home channel；openid 只用于日志核对，不参与路由。
+            proc = subprocess.run(
+                ["/usr/bin/sudo", "-n", "-u", self.admin_user,
+                 self.hermes, "send", "-t", "qqbot", "-f", path],
+                capture_output=True, text=True, timeout=60, env=env)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         if proc.returncode != 0:
             LOG.error("hermes send 退出码 %d：%s",
                       proc.returncode, (proc.stderr or "").strip()[:300])
             return False
-        LOG.info("已投递 QQ 通知（home channel=%s，%d 字）", self.openid, len(text))
+        ***REMOVED*** hermes send 会回报实际投递目标，把它记下来：出问题时这是唯一能证明
+        ***REMOVED*** 消息到底发到哪里的凭据。
+        result = (proc.stdout or "").strip().replace("\n", " ")[:200]
+        LOG.info("已投递 QQ 通知（%d 字）→ %s", len(text), result)
         return True
 
 
