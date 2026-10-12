@@ -33,9 +33,11 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import smtplib
 import string
+import subprocess
 import sys
 import time
 import urllib.error
@@ -79,7 +81,11 @@ class GitHub:
         self.repo = repo
         self.api = api.rstrip("/")
 
-    def _req(self, method, path, body=None, timeout=25):
+    ***REMOVED*** GitHub 的 5xx / 429 都是瞬时的，重试即可。放在传输层统一处理，
+    ***REMOVED*** 比在每个调用点包 try/except 可靠 —— 漏一处就是整条流水线断掉。
+    RETRY_STATUS = (429, 500, 502, 503, 504)
+
+    def _req(self, method, path, body=None, timeout=25, retries=4):
         url = "%s/repos/%s%s" % (self.api, self.repo, path)
         data = None
         headers = {
@@ -92,25 +98,40 @@ class GitHub:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
 
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                if not raw:
-                    return resp.status, None
-                try:
-                    return resp.status, json.loads(raw)
-                except ValueError:
-                    return resp.status, raw.decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            raw = e.read()
+        last = (0, "未执行")
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(url, data=data, headers=headers,
+                                         method=method)
             try:
-                return e.code, json.loads(raw)
-            except Exception:
-                return e.code, raw.decode("utf-8", "replace")[:400]
-        except Exception as e:
-            ***REMOVED*** 网络层失败（DNS/超时），调用方负责重试
-            return 0, str(e)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                    if not raw:
+                        return resp.status, None
+                    try:
+                        return resp.status, json.loads(raw)
+                    except ValueError:
+                        return resp.status, raw.decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    code, payload = e.code, json.loads(raw)
+                except Exception:
+                    code, payload = e.code, raw.decode("utf-8", "replace")[:400]
+                last = (code, payload)
+                if code not in self.RETRY_STATUS or attempt == retries:
+                    return code, payload
+            except Exception as e:
+                ***REMOVED*** 网络层失败（DNS/超时/连接重置）
+                last = (0, str(e))
+                if attempt == retries:
+                    return 0, str(e)
+
+            ***REMOVED*** 指数退避 + 抖动，上限 30s。顺带尊重 Retry-After（若带）
+            wait = min(30, 2 ** attempt) + random.random()
+            LOG.warning("GitHub %s %s 返回 %s，%.1fs 后重试（%d/%d）",
+                        method, path, last[0], wait, attempt + 1, retries)
+            time.sleep(wait)
+        return last
 
     ***REMOVED*** -- 读取 ------------------------------------------------------------
     def issues(self, state="all", since=None, per_page=100):
@@ -260,6 +281,118 @@ class NewAPI:
             self.login()
             code, data = self._req("POST", "/api/user/", body)
         return code, data
+
+    def find_user_by_name(self, username):
+        """按用户名查是否存在账号（含软删行）。找不到返回 None。
+
+        model/user.go SearchUsers 用 `tx.Unscoped()` 查，所以软删的账号
+        也会被搜到 —— 这正好符合我们要的判断：软删不等于注销掉名字，
+        uni_users_username 是全表唯一约束，名字还占着。
+
+        两个实测出来的字段/参数名，别改：
+          · 分页参数是 p / page_size（common/page_info.go:44,47），
+            不是 page / size —— 写错会被当成默认值 1，结果照样能用但
+            容易误以为筛选没生效；
+          · 软删时间序列化成 `DeletedAt`（大写 D），gorm.DeletedAt
+            没有 json tag，走的是字段名本身。
+        """
+        self.ensure_token()
+        q = urllib.parse.urlencode({"keyword": username, "p": 1,
+                                     "page_size": 20})
+        code, data = self._req("GET", "/api/user/search?" + q)
+        if code != 200 or not isinstance(data, dict):
+            LOG.warning("查询用户 %s 失败 HTTP %s: %s", username, code, data)
+            return None
+        items = data.get("data") or {}
+        if not isinstance(items, dict):
+            return None
+        rows = items.get("items") or []
+        for u in rows:
+            ***REMOVED*** keyword 是 LIKE 模糊匹配，必须精确比对 username
+            if (u.get("username") or "") == username:
+                return u
+        return None
+
+    def revoke_user(self, user_id):
+        """把已存在的账号重置密码 —— 用于「重复申请」场景。
+
+        controller/user.go UpdateUser 在改密码时会走
+        requireAdminUserProof(...AdminUserUpdate)，需要 X-Security-Proof，
+        机器人拿不到 —— 所以这条路径走不通，改名反而更干脆。
+        """
+        return None
+
+
+***REMOVED*** --------------------------------------------------------------------------
+***REMOVED*** 邮箱补写（new-api 的 admin API 不支持）
+***REMOVED*** --------------------------------------------------------------------------
+class EmailPatch:
+    """new-api 建号 API 落不了邮箱，这是被源码堵死的：
+
+        controller/user.go:1032  CreateUser 构造 cleanUser 时只抄
+            Username / Password / DisplayName / Role 四个字段，Email 连结构体
+            都进不去；
+        model/user.go  User.EditWithTx 的 updates map 只有
+            username / display_name / group / remark，同样没有 email，
+        所以 UpdateUser 也补不上 —— admin 侧根本没有能写 email 的接口。
+
+    账号本身不受影响（用户名就是邮箱），但 users.email 为空意味着该账号
+    绑不了邮箱、收不到任何系统通知邮件。用户选择了让机器人补写。
+
+    实现走 `docker exec postgres psql` 而不是 psycopg2：主机 python3 没有
+    装驱动，postgres 容器也没把 5432 暴露到宿主机（127.0.0.1:5432 被拒），
+    而 bot 服务跑在 ProtectSystem=strict 沙箱里装不了包。实测该沙箱下
+    docker exec 可用。
+
+    参数一律走 psql 变量 + :'var' 字面量引用（不是字符串拼接），
+    psql 会把值里的单引号转义掉，注入不了。
+    """
+
+    ***REMOVED*** 只允许改这一个字段；表名/字段名写死，不接受外部输入
+    SQL = ("UPDATE users SET email = :'em' "
+           "WHERE username = :'un' AND deleted_at IS NULL "
+           "AND (email IS NULL OR email = '');")
+
+    def __init__(self, container="postgres", db_user="root", db_name="new-api"):
+        self.container = container
+        self.db_user = db_user
+        self.db_name = db_name
+        self.enabled = bool(shutil.which("docker"))
+
+    def _psql(self, sql, **vars_):
+        cmd = ["docker", "exec", "-i", self.container,
+               "psql", "-U", self.db_user, "-d", self.db_name,
+               "-t", "-A", "-v", "ON_ERROR_STOP=1"]
+        for k, v in vars_.items():
+            cmd += ["-v", "%s=%s" % (k, v)]
+        ***REMOVED*** SQL 走 stdin：psql 的 :'var' 变量替换只在 stdin 路径生效，
+        ***REMOVED*** 放在 -c 里会原样输出 ":'var'" 从而语法错误。
+        p = subprocess.run(cmd, input=sql, capture_output=True,
+                           text=True, timeout=30)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+    def backfill(self, username, email):
+        """把建出来的账号的 users.email 补上。返回 (成功, 详情)。"""
+        if not self.enabled:
+            return False, "主机没有 docker 命令，跳过邮箱补写"
+        if not email or "@" not in email:
+            return False, "邮箱格式不合法，拒绝写入"
+        email = email.strip().lower()      ***REMOVED*** 对齐 model.NormalizeEmail
+        try:
+            rc, out, err = self._psql(self.SQL, em=email, un=username.strip())
+        except subprocess.TimeoutExpired:
+            return False, "psql 执行超时"
+        except Exception as e:
+            return False, "%s: %s" % (type(e).__name__, e)
+        if rc != 0:
+            return False, "psql 退出码 %s：%s" % (rc, err[:200])
+        ***REMOVED*** psql 默认回显命令本身，输出形如 "UPDATE 1"，不是裸数字
+        m = re.search(r"UPDATE\s+(\d+)", out)
+        n = int(m.group(1)) if m else 0
+        if n == 0:
+            ***REMOVED*** 已经有人占了这个邮箱，或者用户名没匹配上 —— 都不能当成成功
+            return False, "未更新任何行（邮箱已被占用或用户名不存在）"
+        return True, "已补写 %d 行" % n
 
 
 ***REMOVED*** --------------------------------------------------------------------------
@@ -456,13 +589,19 @@ def finalize(gh, number, keep_note=""):
     LOG.info("***REMOVED***%d 锁定 → HTTP %s %s", number, code, "" if code in (204, 200) else data)
 
 
-def handle(gh, api, mailer, qq, cfg, issue):
+def handle(gh, api, mailer, qq, cfg, issue, pre_existing=False, patcher=None):
+    """pre_existing=True 表示这条申请在机器人启动前就已存在。
+
+    这种单子照样要进等待循环 —— 管理员可能已经回复了 approve，只是机器人在
+    启动那一刻才上线。只有"通知"这一步要跳过，避免重启风暴反复骚扰。
+    """
     number = issue["number"]
     body = issue.get("body") or ""
     author = (issue.get("user") or {}).get("login", "?")
     title = issue.get("title", "")
 
-    LOG.info("处理 issue ***REMOVED***%d（%s）：%s", number, author, title)
+    LOG.info("处理 issue ***REMOVED***%d（%s）：%s%s",
+             number, author, title, "（启动前已存在）" if pre_existing else "")
 
     email, user_qq = parse_application(body)
     if not email:
@@ -487,13 +626,27 @@ def handle(gh, api, mailer, qq, cfg, issue):
         "",
         "处理方式：在该 issue 下回复含 approve 或 reject 的评论即可。",
     ]
+    if pre_existing:
+        lines.insert(1, "（本单在机器人启动前已提交）")
     qq.send("\n".join(lines))
 
     ***REMOVED*** 等管理员决定
     LOG.info("***REMOVED***%d 已通知管理员，进入等待状态（每 %s 秒轮询一次）",
              number, cfg["poll_seconds"])
 
-    seen = {c["id"] for c in gh.issue_comments(number)}
+    ***REMOVED*** 只把机器人自己发的那条通知评论标记为已读，其余评论一律视为待处理。
+    ***REMOVED*** 不能把进入循环时已存在的所有评论都标记已读 —— GitHub 通知有延迟，
+    ***REMOVED*** 管理员完全可能在机器人发现 issue 之前就已经回复了 approve，
+    ***REMOVED*** 那样会被当成"旧评论"永久跳过（实测踩过：评论早到 17 秒就丢了）。
+    seen = set()
+    try:
+        seen = {c["id"] for c in gh.issue_comments(number)
+                if (c.get("user") or {}).get("login", "").endswith("[bot]")}
+    except Exception:
+        ***REMOVED*** 拉不到就退化成"什么都不算已读"，最坏结果只是重读一次自己的通知评论，
+        ***REMOVED*** 不会漏掉管理员的决定。
+        LOG.warning("***REMOVED***%d 初始化已读评论集合失败，退化为空集合", number,
+                    exc_info=True)
     while True:
         time.sleep(cfg["poll_seconds"])
         try:
@@ -546,10 +699,63 @@ def handle(gh, api, mailer, qq, cfg, issue):
             return
 
         ***REMOVED*** approve —— 先建号，再发信；建号失败绝不能发信，否则用户拿到的是无效账号
+
+        ***REMOVED*** 名字已经存在怎么办？两种情况要分开：
+        ***REMOVED***   · 账号还活着（deleted_at 为空）→ 直接把新密码发给本人，这是
+        ***REMOVED***     "重置密码"，member重复提交 issue 时最该发生的行为；
+        ***REMOVED***   · 账号已软删 → uni_users_username 是全表唯一约束，名字仍被占着，
+        ***REMOVED***     重新申请必然失败。此时给名字加一次性后缀，并在邮件里说明。
         pw = gen_password()
         LOG.info("***REMOVED***%d 批准，建号中：username=%s", number, email)
+        username = email            ***REMOVED*** 默认用户名就是邮箱本身
+        existing = api.find_user_by_name(email)
+        if existing is not None:
+            if not existing.get("DeletedAt"):
+                LOG.info("***REMOVED***%d 该邮箱已有活跃账号（id=%s），改为重置密码",
+                         number, existing.get("id"))
+                ***REMOVED*** UpdateUser 改密码需要 X-Security-Proof，机器人拿不到，
+                ***REMOVED*** 所以只能提示管理员手工处理，而不是假装成功。
+                qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 已有活跃账号（id=%s），"
+                        "本次申请不重复建号。\n如需重置密码，请手工在后台操作。"
+                        % (number, email, existing.get("id")))
+                finalize(gh, number,
+                         "**结果：该邮箱已开户**\n\n"
+                         "`%s` 已存在有效账号，本次申请未重复创建。\n\n"
+                         "如需重置密码，请联系管理员。" % email)
+                return
+
+            ***REMOVED*** 软删账号：名字还被占着，换一个新用户名重开。
+            ***REMOVED*** model/user.go:81 Username 是 validate:"max=20"，而registered邮箱
+            ***REMOVED*** "20231234567890@example.edu" 本身就 26 个字符，超长的申请人在
+            ***REMOVED*** 正常路径上就会失败 —— 候选链按长度从长到短试，都塞不下就放弃。
+            base, _, dom = email.partition("@")
+            for cand in ("%s+n%s@%s" % (base, number, dom),
+                         "%s+%s@%s" % (base, str(number)[:4], dom),
+                         "neb%d@%s" % (number, dom)):
+                if len(cand) <= 20:
+                    username = cand
+                    break
+            if username == email:
+                ***REMOVED*** 没有任何候选能压进 20 字符 —— 只能放弃，让管理员手工建号
+                LOG.error("***REMOVED***%d 原用户名 %s 已超 20 字符上限且无法改名",
+                          number, email)
+                qq.send("【Nebula-Zero】***REMOVED***%d 邮箱 %s 长度超过系统 20 字符上限，"
+                        "且该名字已被注销账号占用，无法自动建号，请手工处理。"
+                        % (number, email))
+                finalize(gh, number,
+                         "**结果：批准，但自动建号失败**\n\n"
+                         "邮箱 `%s` 已超过系统用户名 20 字符上限，"
+                         "且该名字被一个已注销的账号占用，请管理员手工创建。" % email)
+                return
+
+            LOG.warning("***REMOVED***%d %s 已被软删账号占用，改用 %s 重新开户",
+                        number, email, username)
+            qq.send("【Nebula-Zero】***REMOVED***%d 注意：%s 曾被一个已注销的账号占用，"
+                    "已改用 %s 作为新用户名（绑定邮箱仍是 %s）。"
+                    % (number, email, username, email))
+
         code, data = api.create_user(
-            username=email, password=pw, email=email,
+            username=username, password=pw, email=email,
             quota=int(cfg["quota"]), role=int(cfg["role"]))
 
         ***REMOVED*** 建号失败就到此为止 —— 绝不能继续发信，否则用户拿到的是无效账号
@@ -564,35 +770,58 @@ def handle(gh, api, mailer, qq, cfg, issue):
                      % (code, data))
             return
 
-        LOG.info("***REMOVED***%d 建号成功，用户名=%s", number, email)
+        LOG.info("***REMOVED***%d 建号成功，用户名=%s", number, username)
+
+        ***REMOVED*** new-api 建号 API 落不了邮箱（CreateUser/EditWithTx 都不写这个字段），
+        ***REMOVED*** 这里补一道 SQL。补写是锦上添花，账号已经建好、凭据已确定，
+        ***REMOVED*** 所以任何异常都必须吞掉，绝不能阻断后面的发信与收尾。
+        if patcher is not None:
+            try:
+                ok, detail = patcher.backfill(username, email)
+                if ok:
+                    LOG.info("***REMOVED***%d 邮箱已补写入库：%s", number, detail)
+                else:
+                    LOG.warning("***REMOVED***%d 邮箱补写失败：%s", number, detail)
+                    qq.send("【Nebula-Zero】***REMOVED***%d 账号已创建，但 users.email 补写失败：%s\n"
+                            "用户名 %s 仍可正常登录，只是收不到系统通知邮件。"
+                            % (number, detail, username))
+            except Exception:
+                LOG.exception("***REMOVED***%d 邮箱补写异常（已忽略，不影响开户）", number)
+
         try:
             mailer.send(email, "【Nebula-Zero】您的账号已开通",
-                        approve_email_body(cfg, email, pw))
+                        approve_email_body(cfg, username, pw, email))
             LOG.info("***REMOVED***%d 开户邮件已发往 %s", number, email)
             note = ("**结果：已通过**\n\n"
-                    "已创建账号并向 %s 发送开户邮件（含初始密码）。" % email)
+                    "已创建账号 `%s` 并向 %s 发送开户邮件（含初始密码）。"
+                    % (username, email))
         except Exception as e:
             LOG.error("***REMOVED***%d 开户邮件发送失败：%s", number, e)
             ***REMOVED*** 账号已建但邮件没发出去——必须告诉管理员密码，否则用户永远拿不到
             qq.send("【Nebula-Zero】***REMOVED***%d 账号已创建但邮件发送失败：%s\n"
                     "用户名 %s，初始密码 %s —— 请手工把凭据发给申请人。"
-                    % (number, e, email, pw))
+                    % (number, e, username, pw))
             note = ("**结果：已通过，但邮件发送失败**\n\n"
                     "账号已创建（用户名 `%s`），但通知邮件未能送达。\n\n"
                     "管理员已收到含初始密码的告警，请手工转发凭据。"
-                    % email)
+                    % username)
 
         finalize(gh, number, note)
         return
 
 
-def approve_email_body(cfg, username, password):
+def approve_email_body(cfg, username, password, email):
+    extra = ""
+    if username != email:
+        extra = ("\n注意：%s 曾被一个已注销的账号占用，"
+                 "因此你的登录用户名是下面这个，绑定邮箱仍是 %s。\n"
+                 % (email, email))
     return (
         "%s 同学你好：\n\n"
         "你的 Nebula-Zero 账号已开通。\n\n"
         "登录地址 : %s\n"
         "用户名   : %s\n"
-        "初始密码 : %s\n\n"
+        "初始密码 : %s\n%s\n"
         "使用须知：\n"
         "  1. 首次登录后请立即在「个人设置」里修改密码。\n"
         "  2. 所有模型当前均为 0 元按量计费，你的账号额度不会因调用而扣减。\n"
@@ -600,7 +829,7 @@ def approve_email_body(cfg, username, password):
         "  4. 上游为公开免费服务，偶发限流或临时不可用属正常现象，可稍后重试。\n\n"
         "如有任何问题，直接在本仓库开 issue 询问即可。\n\n"
         "—— Nebula-Zero 自动开户系统\n"
-        % (username, cfg["site_url"], username, password)
+        % (username, cfg["site_url"], username, password, extra)
     )
 
 
@@ -648,6 +877,19 @@ def main():
                     use_ssl=conf.get("SMTP_SSL", "true").lower() == "true")
     qq = QQNotify(conf["HERMES_HOME"], conf["NEWAPI_ADMIN_USER"],
                   conf.get("QQ_HOME_CHANNEL", ""))
+
+    ***REMOVED*** new-api 建号 API 落不了邮箱，靠这个补写。可用 BACKFILL_EMAIL=false 关掉。
+    patcher = None
+    if conf.get("BACKFILL_EMAIL", "true").lower() == "true":
+        patcher = EmailPatch(
+            conf.get("PG_CONTAINER", "postgres"),
+            conf.get("PG_USER", "root"),
+            conf.get("PG_DATABASE", "new-api"))
+        LOG.info("邮箱补写：%s（容器=%s）",
+                 "已启用" if patcher.enabled else "已禁用（无 docker 命令）",
+                 patcher.container)
+    else:
+        LOG.info("邮箱补写：已通过 BACKFILL_EMAIL=false 关闭")
 
     handle_conf = {
         "label": conf.get("LABEL", "申请"),
@@ -713,18 +955,9 @@ def main():
                 if TEMPLATE_MARK not in body:
                     seen.add(n)          ***REMOVED*** 不是申请，不归我们管
                     continue
-                if first:
-                    ***REMOVED*** 启动时已在库的申请，只通知不自动处理，避免重启风暴误批
-                    LOG.info("***REMOVED***%d 是启动前已存在的申请，仅通知管理员", n)
-                    email, uqq = parse_application(body)
-                    qq.send("【Nebula-Zero】当前有 %d 条待处理申请，"
-                            "最新为 ***REMOVED***%d（%s）"
-                            % (len(gh.issues("open", per_page=100)), n, email or "未识别邮箱"))
-                    seen.add(n)
-                    continue
-
                 try:
-                    handle(gh, api, mailer, qq, handle_conf, issue)
+                    handle(gh, api, mailer, qq, handle_conf, issue,
+                           pre_existing=first, patcher=patcher)
                 except Exception:
                     LOG.exception("处理 ***REMOVED***%d 时异常", n)
                 seen.add(n)
