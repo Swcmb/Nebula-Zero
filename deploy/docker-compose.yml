@@ -13,8 +13,11 @@ services:
     container_name: new-api
     restart: always
     command: --log-dir /app/logs
+    ***REMOVED*** 只绑回环，不对公网暴露裸 HTTP。
+    ***REMOVED*** 公网入口一律走 caddy 的 443（HTTPS）。若这里写 '3000:3000'，
+    ***REMOVED*** 任何人都能用明文抓到你的账号密码和 API Key，HTTPS 就白配了。
     ports:
-      - '3000:3000'
+      - '127.0.0.1:3000:3000'
     volumes:
       - ./data:/data
       - ./logs:/app/logs
@@ -89,3 +92,31 @@ services:
 
 volumes:
   pg_data:
+
+  ***REMOVED*** Caddy：自动签发并续期 Let's Encrypt 证书，把 443 的 HTTPS 转给 new-api。
+  ***REMOVED***
+  ***REMOVED*** 为什么需要它：Let's Encrypt 不签发「IP 地址证书」，
+  ***REMOVED*** 但签发形如 <IP>.sslip.io 的域名证书（sslip.io 是把 IP 反解成域名的公开服务）。
+  ***REMOVED*** 有域名就不需要这层；没有域名时它是唯一能在浏览器里拿到受信任证书的办法。
+  ***REMOVED***
+  ***REMOVED*** 启动前先把它接进 new-api 的网络，否则按容器名反代会解析失败：
+  ***REMOVED***   docker network connect new-api_default caddy
+  ***REMOVED*** 挂载的 Caddyfile 用 CADDY_DOMAIN 占位，首次部署时替换成你的实际域名。
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      new-api:
+        condition: service_started
+    ports:
+      - '80:80' ***REMOVED*** ACME 验证 + 跳转 HTTPS
+      - '443:443'
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data ***REMOVED*** 证书与私钥，删了这个 volume 就要重新签发
+      - caddy-config:/config
+    ***REMOVED*** 服务器内存只有 1.6G，给 Caddy 设上限，别让它被 OOM 干掉连累 new-api
+    mem_limit: 128m

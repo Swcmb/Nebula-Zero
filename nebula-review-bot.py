@@ -1318,9 +1318,10 @@ def approve_email_body(cfg, username, password, email, randomized=False):
         "  2. 所有模型当前均为 0 元按量计费，你的账号额度不会因调用而扣减。\n"
         "  3. 创建自己的 API Key 后即可调用，接口地址见下方三种协议。\n"
         "  4. 上游为公开免费服务，偶发限流或临时不可用属正常现象，可稍后重试。\n\n"
-        "如有任何问题，直接在本仓库开 issue 询问即可。\n\n"
-        "—— Nebula-Zero 自动开户系统\n"
+        "如有任何问题，直接在本仓库开 issue 询问即可。\n"
         % (username, site, username, password)
+    ) + _qq_group_plain() + (
+        "\n—— Nebula-Zero 自动开户系统\n"
     )
 
     def kv(label, value, mono=True):
@@ -1350,6 +1351,7 @@ def approve_email_body(cfg, username, password, email, randomized=False):
              "<tr><td style='padding:12px 14px;font-size:13px;line-height:1.7;"
              "color:***REMOVED***7f1d1d'><b>请注意</b>：首次登录后立刻在「个人设置」里"
              "改掉这个初始密码。</td></tr></table>",
+        group=_qq_group_block("必须加入官方 QQ 群"),
         usage=_protocol_block(site) +
               "<div style='font-size:13px;line-height:1.9;color:***REMOVED***334155;"
               "margin-top:18px'>"
@@ -1372,8 +1374,10 @@ def reject_email_body(cfg, title):
         "  · 申请邮箱不属于本站允许的注册域名\n"
         "  · 申请信息填写不完整\n"
         "  · 申请提交频率过于频繁\n\n"
-        "如果你认为这是误判，欢迎在原 issue 下补充说明，或直接重新提交一份申请。\n\n"
-        "—— Nebula-Zero 自动开户系统\n" % title
+        "如果你认为这是误判，欢迎在原 issue 下补充说明，或直接重新提交一份申请。\n"
+        % title
+    ) + _qq_group_plain("官方 QQ 群（有问题也可以在这里问）") + (
+        "\n—— Nebula-Zero 自动开户系统\n"
     )
     html = _MAIL_SHELL.format(
         title="您的申请未通过",
@@ -1391,6 +1395,7 @@ def reject_email_body(cfg, title):
               "· 申请提交频率过于频繁</td></tr></table>",
         note="",
         warn="",
+        group=_qq_group_block("官方 QQ 群（有问题也可以在这里问）"),
         usage="<p style='margin:0;font-size:13px;line-height:1.8;"
               "color:***REMOVED***334155'>如果你认为这是误判，欢迎在原 issue 下"
               "补充说明，或直接重新提交一份申请。</p>",
@@ -1445,6 +1450,51 @@ def _esc(text):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+***REMOVED*** 官方 QQ 群。做成配置项而不是写死，因为公开仓库里的这份代码
+***REMOVED*** 会被别人拿去用 —— 你的群链接不该硬塞进他们的部署里。
+***REMOVED*** 启动时从 QQ_GROUP_URL 读进来；没配就退回下面这个占位值，
+***REMOVED*** 这样本仓库自测时预览邮件仍然完整，而别人复制走也不会带上我的群。
+QQ_GROUP_URL_DEFAULT = "https://qm.qq.com/q/替换成你的群链接"
+
+
+def _qq_group_plain(lead="必须加入官方 QQ 群"):
+    return (
+        "\n%s：%s\n"
+        "  这是获取帮助、反馈问题和接收公告的唯一渠道。\n"
+        "  不加群可能会漏掉重要通知（比如上游维护、限流调整），请务必加入。\n"
+        % (lead, QQ_GROUP_URL)
+    )
+
+
+def _qq_group_block(lead="必须加入官方 QQ 群"):
+    """邮件里的 QQ 群提醒。用暖色底 + 粗边框，视觉上足够跳，
+    不能埋在小字里 —— 群链接埋得太深等于没有。
+
+    用 str.format 具名占位符而非 %-格式化，原因同 _MAIL_SHELL：
+    这段 CSS 里全是 width:100% 这种百分号。"""
+    return (
+        "<table width='100%' cellpadding='0' cellspacing='0' "
+        "style='background:***REMOVED***eef2ff;border:2px solid ***REMOVED***4f46e5;"
+        "border-radius:10px;margin-top:22px'>"
+        "<tr><td style='padding:16px 16px 14px 16px'>"
+        "<div style='font-size:15px;font-weight:700;color:***REMOVED***312e81;"
+        "line-height:1.6'>{lead}</div>"
+        "<div style='margin-top:10px'>"
+        "<a href='{url}' "
+        "style='display:inline-block;background:***REMOVED***4f46e5;color:***REMOVED***ffffff;"
+        "text-decoration:none;font-size:15px;font-weight:600;"
+        "padding:9px 20px;border-radius:6px'>点击加入 QQ 群</a>"
+        "</div>"
+        "<div style='font-family:Consolas,Menlo,monospace;font-size:13px;"
+        "color:***REMOVED***3730a3;margin-top:9px;word-break:break-all'>{url}</div>"
+        "<div style='margin-top:10px;font-size:13px;line-height:1.85;"
+        "color:***REMOVED***4338ca'>这是获取帮助、反馈问题和接收公告的<b>唯一渠道</b>。"
+        "不加群可能会漏掉重要通知（比如上游维护、限流调整），"
+        "请务必加入。</div>"
+        "</td></tr></table>"
+    ).format(lead=lead, url=QQ_GROUP_URL)
+
+
 ***REMOVED*** 邮件外壳：全部 inline 样式。QQ 邮箱会丢弃 <style> 块和部分 CSS，
 ***REMOVED*** 所以配色、间距、内边距都写在内联属性上，靠 table 布局兜住各家客户端。
 ***REMOVED***
@@ -1472,6 +1522,7 @@ _MAIL_SHELL = (
     "<tr><td style='padding:12px 24px 0 24px'>{creds}</td></tr>"
     "<tr><td style='padding:0 24px'>{note}</td></tr>"
     "<tr><td style='padding:18px 24px 0 24px'>{warn}</td></tr>"
+    "<tr><td style='padding:0 24px'>{group}</td></tr>"
     "<tr><td style='padding:22px 24px 22px 24px'>{usage}</td></tr>"
 
     "<tr><td style='padding:26px 24px 22px 24px'>"
@@ -1525,8 +1576,8 @@ def main():
                   conf.get("QQ_HOME_CHANNEL", ""))
 
     ***REMOVED*** QQ 指令通道：让管理员在手机上发「***REMOVED***N approve」就能批准，不必去 GitHub 网页。
-    ***REMOVED*** QQ 指令通道：优先读 hermes-plugin/nebula-qq-sink 写的队列文件（Hermes 保持
-    ***REMOVED*** 沉默）；没配队列时退回只读 Hermes 的 state.db。
+    ***REMOVED*** 优先读 hermes-plugin/nebula-qq-sink 写的队列文件（Hermes 保持沉默）；
+    ***REMOVED*** 没配队列时退回只读 Hermes 的 state.db。
     qq_inbox = None
     if conf.get("QQ_COMMAND", "true").lower() == "true":
         admin_user = conf.get("HERMES_ADMIN_USER", conf["NEWAPI_ADMIN_USER"])
@@ -1560,10 +1611,22 @@ def main():
     else:
         LOG.info("邮箱补写：已通过 BACKFILL_EMAIL=false 关闭")
 
+    ***REMOVED*** 邮件里要印的群链接。必须用 global 声明写，因为 _qq_group_plain /
+    ***REMOVED*** _qq_group_block 在模块顶层读这个全局量。
+    global QQ_GROUP_URL
+    QQ_GROUP_URL = (conf.get("QQ_GROUP_URL") or "").strip() \
+        or QQ_GROUP_URL_DEFAULT
+    if QQ_GROUP_URL != QQ_GROUP_URL_DEFAULT:
+        LOG.info("开户邮件将附带 QQ 群链接：%s", QQ_GROUP_URL)
+    else:
+        LOG.warning("未配置 QQ_GROUP_URL，开户邮件里的群链接仍是占位符，"
+                    "请在 %s 里填上真实群链接", args.config)
+
     handle_conf = {
         "label": conf.get("LABEL", "申请"),
         "repo_url": "https://github.com/%s" % conf["GITHUB_REPO"],
-        "site_url": conf.get("SITE_URL", "http://YOUR_HOST:3000"),
+        "site_url": conf.get("SITE_URL") or conf.get("PUBLIC_BASE_URL")
+                  or "http://YOUR_HOST:3000",
         "quota": conf.get("NEW_USER_QUOTA", "500000000"),
         "role": conf.get("NEW_USER_ROLE", "1"),
         "poll_seconds": int(conf.get("POLL_SECONDS", "30")),

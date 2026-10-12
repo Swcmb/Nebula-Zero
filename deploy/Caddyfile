@@ -1,0 +1,49 @@
+***REMOVED*** Nebula Zero 的 HTTPS 入口。
+***REMOVED***
+***REMOVED*** 这是 new-api 唯一的公网入口：Caddy 终结 TLS，再把请求转给容器里的
+***REMOVED*** new-api。new-api 自己的 3000 端口只绑 127.0.0.1，公网拿不到裸 HTTP。
+***REMOVED***
+***REMOVED*** 部署要点：
+***REMOVED***   1. 把 CADDY_DOMAIN 设成你的域名（见 .env.example）
+***REMOVED***   2. 首次 up 之后手动接一次网络，让容器名可解析：
+***REMOVED***        docker network connect <项目网络> caddy
+***REMOVED***      （Caddy 与 new-api 在同一 compose 项目内时不需要这一步；
+***REMOVED***       分开部署时必须做，否则按容器名反代会解析失败。）
+***REMOVED***
+***REMOVED*** 为什么用域名而不是裸 IP：Let's Encrypt 不签发 IP 证书，
+***REMOVED*** 只签发域名证书。没有自有域名时可以用 <IP>.sslip.io 这类
+***REMOVED*** 由公共 DNS 把 IP 反解成域名的服务（nip.io / sslip.io 同源）。
+
+{$CADDY_DOMAIN} {
+	encode gzip zstd
+
+	***REMOVED*** new-api 走 HTTP/1.1，SSE 流式响应必须关缓冲，
+	***REMOVED*** 否则流式输出会被攒成一大坨最后一次性吐出来。
+	***REMOVED*** 按容器名反代：Caddy 已接入 new-api 的网络，
+	***REMOVED*** 不再经宿主机端口映射，所以 3000 可以安全地只绑回环。
+	reverse_proxy new-api:3000 {
+		flush_interval -1
+		transport http {
+			read_buffer 0
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
+
+***REMOVED*** http 自动跳 https（Caddy 自带 ACME 会先在 80 上验证）
+http://{$CADDY_DOMAIN} {
+	redir https://{host}{uri} permanent
+}
