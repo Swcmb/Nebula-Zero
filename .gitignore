@@ -21,6 +21,10 @@ services/opencode2api/dist/
 *.swp
 .DS_Store
 
+***REMOVED*** Python
+__pycache__/
+*.pyc
+
 ***REMOVED*** 意外混入的密钥文件（兜底）
 .env
 *.pem
