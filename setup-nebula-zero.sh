@@ -1,25 +1,25 @@
-***REMOVED***!/usr/bin/env bash
-***REMOVED*** =============================================================================
-***REMOVED*** Nebula-Zero 一键配置脚本（3 Stage 版）
-***REMOVED***
-***REMOVED***   Stage 1  校验 Hermes QQ 渠道依赖（aiohttp / httpx）
-***REMOVED***   Stage 2  写入 QQ Bot 凭据并重启 gateway
-***REMOVED***   Stage 3  存放 GitHub fine-grained PAT 并校验权限
-***REMOVED***
-***REMOVED*** 为什么没有"修 GitHub 出网"这一步：
-***REMOVED***   实测结论 —— api.github.com 直连可用（200, 0.30s），这是审核机器人唯一的
-***REMOVED***   GitHub 依赖；github.com 的 38 个官方 web IP 全部 443 不可达，而审核机器人、
-***REMOVED***   QQ 通道、代码上传都不需要它。唯一的用途是 GitHub OAuth 的换 token 请求，
-***REMOVED***   而那需要让 client_secret 和用户 access token 经过不受信任的第三方免费代理。
-***REMOVED***   这个代价不值得，所以 GitHub OAuth 保持关闭，出网问题留待上 HTTPS / 配代理时
-***REMOVED***   一并解决。
-***REMOVED***
-***REMOVED*** 用法（必须交互式，缺 -t 会导致无法输入凭据）：
-***REMOVED***   scp setup-nebula-zero.sh root@YOUR_HOST:/root/
-***REMOVED***   ssh -t root@YOUR_HOST 'bash /root/setup-nebula-zero.sh'
-***REMOVED***
-***REMOVED*** 全程幂等：重复执行安全。已存在的配置会被覆盖前先备份。
-***REMOVED*** =============================================================================
+#!/usr/bin/env bash
+# =============================================================================
+# Nebula-Zero 一键配置脚本（3 Stage 版）
+#
+#   Stage 1  校验 Hermes QQ 渠道依赖（aiohttp / httpx）
+#   Stage 2  写入 QQ Bot 凭据并重启 gateway
+#   Stage 3  存放 GitHub fine-grained PAT 并校验权限
+#
+# 为什么没有"修 GitHub 出网"这一步：
+#   实测结论 —— api.github.com 直连可用（200, 0.30s），这是审核机器人唯一的
+#   GitHub 依赖；github.com 的 38 个官方 web IP 全部 443 不可达，而审核机器人、
+#   QQ 通道、代码上传都不需要它。唯一的用途是 GitHub OAuth 的换 token 请求，
+#   而那需要让 client_secret 和用户 access token 经过不受信任的第三方免费代理。
+#   这个代价不值得，所以 GitHub OAuth 保持关闭，出网问题留待上 HTTPS / 配代理时
+#   一并解决。
+#
+# 用法（必须交互式，缺 -t 会导致无法输入凭据）：
+#   scp setup-nebula-zero.sh root@YOUR_HOST:/root/
+#   ssh -t root@YOUR_HOST 'bash /root/setup-nebula-zero.sh'
+#
+# 全程幂等：重复执行安全。已存在的配置会被覆盖前先备份。
+# =============================================================================
 set -uo pipefail
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; RST=$'\033[0m'
@@ -36,12 +36,12 @@ HERMES_PY=$HERMES_HOME/tools/python-3.14.7+20260901-linux-x64/bin/python3
 RUN_DIR=/run/user/1000
 NEB_DIR=/root/.nebula-zero
 
-***REMOVED*** 审核机器人用到的凭据与地址，集中在这里便于排查
+# 审核机器人用到的凭据与地址，集中在这里便于排查
 GITHUB_REPO=Swcmb/Nebula-Zero
 
-***REMOVED*** -----------------------------------------------------------------------------
-***REMOVED*** Stage 0 — 前置检查
-***REMOVED*** -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Stage 0 — 前置检查
+# -----------------------------------------------------------------------------
 stage "Stage 0 — 前置检查"
 
 [ "$(id -u)" -eq 0 ] || die "必须用 root 执行"
@@ -72,15 +72,15 @@ CH_BEFORE=$(docker exec postgres psql -U root -d new-api -t -A \
   -c "select count(*) from channels;" 2>/dev/null || echo "?")
 ok "基线：live_users=$USR_BEFORE  channels=$CH_BEFORE"
 
-***REMOVED*** -----------------------------------------------------------------------------
-***REMOVED*** Stage 1 — Hermes QQ 渠道依赖
-***REMOVED*** -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Stage 1 — Hermes QQ 渠道依赖
+# -----------------------------------------------------------------------------
 stage "Stage 1 — 校验 Hermes QQ 渠道依赖（aiohttp / httpx）"
 
-***REMOVED*** 关键事实：gateway 不用系统 python，也不用 hermes-agent/.venv，而是用它在
-***REMOVED*** installs/<hash>/environments/<hash>/venv 下自建的 venv（hermes_bootstrap 会把它
-***REMOVED*** 的 site-packages 注入 sys.path）。早前用系统 python 检查会误判"依赖缺失"。
-***REMOVED*** 所以这里只做"定位 + 校验"，不主动安装任何东西。
+# 关键事实：gateway 不用系统 python，也不用 hermes-agent/.venv，而是用它在
+# installs/<hash>/environments/<hash>/venv 下自建的 venv（hermes_bootstrap 会把它
+# 的 site-packages 注入 sys.path）。早前用系统 python 检查会误判"依赖缺失"。
+# 所以这里只做"定位 + 校验"，不主动安装任何东西。
 
 find_gateway_venv() {
   sudo -u "$HERMES_USER" "$HERMES_PY" -I -c "
@@ -128,9 +128,9 @@ else
   warn "找不到 gateway venv，跳过依赖校验（Stage 2 的平台接入验证会暴露问题）"
 fi
 
-***REMOVED*** -----------------------------------------------------------------------------
-***REMOVED*** Stage 2 — 写入 QQ Bot 凭据
-***REMOVED*** -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Stage 2 — 写入 QQ Bot 凭据
+# -----------------------------------------------------------------------------
 stage "Stage 2 — 写入 QQ Bot 凭据到 Hermes"
 
 if [ -t 0 ]; then
@@ -153,11 +153,11 @@ ENVFILE=$HERMES_HOME/.env
 chmod 600 "$ENVFILE"
 cp -a "$ENVFILE" "$ENVFILE.bak.$(date +%Y%m%d-%H%M%S)"
 
-***REMOVED*** 幂等：先删旧的 QQ_* 行再追加，避免重复键
+# 幂等：先删旧的 QQ_* 行再追加，避免重复键
 sed -i '/^QQ_APP_ID=/d;/^QQ_CLIENT_SECRET=/d;/^QQBOT_HOME_CHANNEL=/d;/^QQBOT_HOME_CHANNEL_NAME=/d;/^QQ_ALLOWED_USERS=/d;/^QQ_ALLOW_ALL_USERS=/d' "$ENVFILE"
 cat >> "$ENVFILE" <<EOF
 
-***REMOVED*** --- Nebula-Zero QQ Bot（脚本写入 $(date '+%F %T')）---
+# --- Nebula-Zero QQ Bot（脚本写入 $(date '+%F %T')）---
 QQ_APP_ID=$QQ_APP_ID
 QQ_CLIENT_SECRET=$QQ_CLIENT_SECRET
 QQBOT_HOME_CHANNEL=$QQ_OPENID
@@ -196,9 +196,9 @@ case "$PLATFORMS" in
     ;;
 esac
 
-***REMOVED*** -----------------------------------------------------------------------------
-***REMOVED*** Stage 3 — GitHub PAT
-***REMOVED*** -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Stage 3 — GitHub PAT
+# -----------------------------------------------------------------------------
 stage "Stage 3 — 存放 GitHub Fine-grained PAT 并校验权限"
 
 printf '  GitHub Fine-grained PAT: '; read -r GH_PAT
@@ -206,10 +206,10 @@ printf '  GitHub Fine-grained PAT: '; read -r GH_PAT
 
 mkdir -p "$NEB_DIR"; chmod 700 "$NEB_DIR"
 cat > "$NEB_DIR/github.env" <<EOF
-***REMOVED*** Nebula-Zero 审核机器人 · GitHub 凭据（写入于 $(date '+%F %T')）
-***REMOVED*** 该 PAT 的权限应严格限定为：
-***REMOVED***   Repository access: 仅 Swcmb/Nebula-Zero
-***REMOVED***   Permissions: Issues -> Read and write ; Metadata -> Read-only
+# Nebula-Zero 审核机器人 · GitHub 凭据（写入于 $(date '+%F %T')）
+# 该 PAT 的权限应严格限定为：
+#   Repository access: 仅 Swcmb/Nebula-Zero
+#   Permissions: Issues -> Read and write ; Metadata -> Read-only
 GITHUB_TOKEN=$GH_PAT
 GITHUB_REPO=$GITHUB_REPO
 GITHUB_API=https://api.github.com
@@ -244,7 +244,7 @@ LABEL_CODE=$(curl -s -o /tmp/label-check.json -w "%{http_code}" --max-time 20 "$
 if [ "$LABEL_CODE" != "200" ]; then
   log "  标签不存在，尝试创建"
   MKCODE=$(curl -s -o /tmp/label-make.json -w "%{http_code}" --max-time 20 -X POST "${GH_HDR[@]}" \
-    -d '{"name":"申请","color":"0e8a16","description":"member自助开户申请"}' \
+    -d '{"name":"申请","color":"0e8a16","description":"账号申请"}' \
     "https://api.github.com/repos/$GITHUB_REPO/labels" 2>/dev/null)
   case "$MKCODE" in
     201) ok "标签 申请 已创建" ;;
@@ -255,9 +255,9 @@ else
   ok "标签 申请 已存在"
 fi
 
-***REMOVED*** -----------------------------------------------------------------------------
-***REMOVED*** 汇总
-***REMOVED*** -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 汇总
+# -----------------------------------------------------------------------------
 stage "配置完成 — 汇总"
 
 USR_AFTER=$(docker exec postgres psql -U root -d new-api -t -A \

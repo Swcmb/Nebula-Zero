@@ -5,4 +5,4 @@ contact_links:
     about: 技术问题也请走 issue，描述现象与复现步骤（直接新建空白 issue）
   - name: 账号申请
     url: https://github.com/Swcmb/Nebula-Zero/issues/new?template=account-application.yml
-    about: 申请模型调用账号，仅限 @example.edu registered邮箱
+    about: 申请模型调用账号，需要能在本站注册并收信

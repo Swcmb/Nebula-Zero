@@ -1,6 +1,6 @@
 name: 账号申请
-description: 申请 Nebula Zero 的模型调用账号（仅限the organizationregistered邮箱）
-title: "[申请] ID/姓名 - registered邮箱"
+description: 申请 Nebula Zero 的模型调用账号
+title: "[申请] 昵称 - 注册邮箱"
 labels: ["申请"]
 body:
   - type: markdown
@@ -9,40 +9,31 @@ body:
         感谢申请 Nebula Zero 的模型调用账号。
 
         **提交前请确认：**
-        1. 你的registered邮箱是 `@example.edu` 结尾
-        2. 你的registered邮箱能正常接收邮件（记得看垃圾箱）
-        3. 本账号仅供本人学习研究使用，请勿用于商业用途或对外提供服务
+        1. 填的邮箱是你在本注册站能正常收信的邮箱（记得看垃圾箱）
+        2. 本账号仅供本人使用，请勿用于商业用途或对外提供服务
 
-        **关于登录用户名：** 系统会默认取你registered邮箱 `@` 前面的部分作为登录用户名
-        （例如 `2023010101@example.edu` → 用户名 `2023010101`），
+        **关于登录用户名：** 系统会默认取你邮箱 `@` 前面的部分作为登录用户名
+        （例如 `alice@example.com` → 用户名 `alice`），
         因为平台用户名有 20 字符上限，装不下完整邮箱地址。
         登录时填用户名或直接填完整邮箱都可以。
 
-        管理员审核通过后，账号和初始密码会**自动发送到你的registered邮箱**，
+        管理员审核通过后，账号和初始密码会**自动发送到你的邮箱**，
         请留意邮件（含垃圾邮件箱）。首次登录后请立刻修改初始密码。
 
   - type: input
     id: name
     attributes:
-      label: 姓名
+      label: 昵称
       placeholder: 张三
-    validations:
-      required: true
-
-  - type: input
-    id: student-id
-    attributes:
-      label: ID
-      placeholder: 2023010101
     validations:
       required: true
 
   - type: input
     id: email
     attributes:
-      label: registered邮箱
-      description: 仅接受 @example.edu 结尾的邮箱
-      placeholder: 2023010101@example.edu
+      label: 注册邮箱
+      description: 必须是本站允许的注册域名，收不到邮件就开不了号
+      placeholder: alice@example.com
     validations:
       required: true
 
@@ -59,8 +50,8 @@ body:
     id: purpose
     attributes:
       label: 使用场景
-      description: 简单说明你的用途，例如课程作业、毕业设计、个人学习
-      placeholder: 毕业设计需要调用 LLM 做数据分析...
+      description: 简单说明你的用途，例如个人学习、课程作业、项目原型
+      placeholder: 个人学习，需要调用 LLM 做文本总结...
     validations:
       required: false
 
