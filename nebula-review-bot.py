@@ -396,54 +396,51 @@ class EmailPatch:
 
 
 ***REMOVED*** --------------------------------------------------------------------------
-***REMOVED*** QQ 通知（走 Hermes gateway 的 cron 投递通道）
+***REMOVED*** QQ 通知（走 Hermes 的 hermes send 直发通道）
 ***REMOVED*** --------------------------------------------------------------------------
 class QQNotify:
-    """Hermes 的主动推送靠 cron 任务上的 deliver 字段（scheduler_delivery.py:56
-    把 qqbot 映射到 QQBOT_HOME_CHANNEL）。所以这里直接往 Hermes 的 jobs.json
-    里追加一个一次性任务，由 gateway 消费后推送到 QQ。"""
+    """调 `hermes send -t qqbot`，由 Hermes 复用 gateway 已配置的平台凭据投递，
+    不经过 agent、不需要 LLM。
 
-    def __init__(self, hermes_home, admin_user, openid):
-        self.jobs = os.path.join(hermes_home, "cron", "jobs.json")
+    曾经写成往 ~/.hermes/cron/jobs.json 里追加 `deliver=qqbot` 的一次性任务，
+    靠 gateway 的 ticker 消费。实测那条路**从未生效**：Hermes 不认 "manual"
+    这个调度类型，规范化后 schedule 变成 {}（无 kind / run_at），ticker 无从
+    触发，executions.db 里也查不到任何执行记录；同时 no_agent=True 不带
+    script 本身就是非法组合（cron/jobs.py:1788 NO_AGENT_WITHOUT_SCRIPT_ERROR），
+    jobs.json 里因此攒下了 12 条永不执行的僵尸任务。
+    `hermes send` 是官方为此提供的脚本管道通道，直接投递，无中间状态。"""
+
+    def __init__(self, hermes_bin, admin_user, openid):
+        self.hermes = hermes_bin
         self.admin_user = admin_user
         self.openid = openid
+        try:
+            self.uid = os.stat("/home/%s" % admin_user).st_uid
+        except OSError:
+            self.uid = 1000
 
     def send(self, text):
         try:
-            return self._append_job(text)
+            return self._deliver(text)
         except Exception as e:
             LOG.error("QQ 通知失败：%s", e)
             return False
 
-    def _append_job(self, text):
-        import fcntl          ***REMOVED*** Linux 专用；机器人本来就跑在服务器上
-        os.makedirs(os.path.dirname(self.jobs), exist_ok=True)
-
-        with open(self.jobs, "a+", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            raw = f.read().strip()
-            data = json.loads(raw) if raw else []
-            if isinstance(data, dict):
-                data = data.get("jobs", [])
-
-            job = {
-                "id": "nebula-" + secrets.token_hex(4),
-                "name": "Nebula-Zero 申请通知",
-                "created_at": int(time.time()),
-                "schedule": "manual",          ***REMOVED*** 只投递一次，不做周期
-                "deliver": "qqbot",
-                "no_agent": True,              ***REMOVED*** 纯文本直发，不消耗 agent
-                "message": text,
-                "one_shot": True,
-            }
-            data.append(job)
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-        LOG.info("已投递 QQ 通知（job id=%s）", job["id"])
+    def _deliver(self, text):
+        import subprocess
+        env = dict(os.environ)
+        env["HOME"] = "/home/%s" % self.admin_user
+        env["XDG_RUNTIME_DIR"] = "/run/user/%d" % self.uid
+        ***REMOVED*** -t qqbot 走 home channel；openid 只用于日志核对，不参与路由。
+        proc = subprocess.run(
+            ["/usr/bin/sudo", "-n", "-u", self.admin_user,
+             self.hermes, "send", "-t", "qqbot", "-q", text],
+            capture_output=True, text=True, timeout=60, env=env)
+        if proc.returncode != 0:
+            LOG.error("hermes send 退出码 %d：%s",
+                      proc.returncode, (proc.stderr or "").strip()[:300])
+            return False
+        LOG.info("已投递 QQ 通知（home channel=%s，%d 字）", self.openid, len(text))
         return True
 
 
@@ -875,7 +872,9 @@ def main():
     mailer = Mailer(conf["SMTP_HOST"], conf["SMTP_PORT"], conf["SMTP_ACCOUNT"],
                     conf["SMTP_TOKEN"], conf.get("SMTP_FROM") or conf["SMTP_ACCOUNT"],
                     use_ssl=conf.get("SMTP_SSL", "true").lower() == "true")
-    qq = QQNotify(conf["HERMES_HOME"], conf["NEWAPI_ADMIN_USER"],
+    qq = QQNotify(conf.get("HERMES_BIN",
+                          "/home/admin/.hermes/hermes-agent/.hermes/bin/hermes"),
+                  conf.get("HERMES_ADMIN_USER", conf["NEWAPI_ADMIN_USER"]),
                   conf.get("QQ_HOME_CHANNEL", ""))
 
     ***REMOVED*** new-api 建号 API 落不了邮箱，靠这个补写。可用 BACKFILL_EMAIL=false 关掉。

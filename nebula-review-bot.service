@@ -23,9 +23,9 @@ ProtectSystem=strict
 ***REMOVED*** 此时下方的 ReadWritePaths 无法为其子目录开口子，QQNotify 写 jobs.json 会失败。
 ProtectHome=read-only
 ReadWritePaths=/root/.nebula-zero
-***REMOVED*** QQ 通知走 Hermes 的 cron 投递通道：机器人往 jobs.json 追加一次性任务，
-***REMOVED*** 由 gateway 消费后推送到 QQ。该目录必须可写，否则 QQNotify.send() 会静默失败。
-ReadWritePaths=/home/admin/.hermes/cron
+***REMOVED*** QQ 通知调 `hermes send`，它要写 Hermes 的 state.db，所以整个 .hermes
+***REMOVED*** 目录都得可写。只给 cron 子目录开口子会报 "state.db is not writable"。
+ReadWritePaths=/home/admin/.hermes
 ***REMOVED*** 出网只需要这几个
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
