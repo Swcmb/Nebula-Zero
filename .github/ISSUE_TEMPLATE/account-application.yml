@@ -24,7 +24,7 @@ body:
     id: name
     attributes:
       label: 昵称
-      placeholder: 张三
+      placeholder: "张三"
     validations:
       required: true
 
@@ -33,7 +33,7 @@ body:
     attributes:
       label: 注册邮箱
       description: 必须是本站允许的注册域名，收不到邮件就开不了号
-      placeholder: alice@example.com
+      placeholder: "alice@example.com"
     validations:
       required: true
 
@@ -42,7 +42,7 @@ body:
     attributes:
       label: QQ号
       description: 用于管理员审核时联系你，不会公开
-      placeholder: 123456789
+      placeholder: "123456789"
     validations:
       required: true
 
@@ -51,7 +51,7 @@ body:
     attributes:
       label: 使用场景
       description: 简单说明你的用途，例如个人学习、课程作业、项目原型
-      placeholder: 个人学习，需要调用 LLM 做文本总结...
+      placeholder: "个人学习，需要调用 LLM 做文本总结..."
     validations:
       required: false
 
@@ -62,5 +62,3 @@ body:
       options:
         - label: 我已阅读并同意本项目的行为规范，不会将本服务用于商业用途或对外转售
           required: true
-
-<!-- application-template: account-application -->
