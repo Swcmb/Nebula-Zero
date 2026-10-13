@@ -1,8 +1,1 @@
-blank_issues_enabled: false
-contact_links:
-  - name: 部署问题 / 技术咨询
-    url: https://github.com/Swcmb/Nebula-Zero/issues/new?title=%5B%E9%97%AE%E9%A2%98%5D&labels=question
-    about: 技术问题也请走 issue，描述现象与复现步骤（直接新建空白 issue）
-  - name: 账号申请
-    url: https://github.com/Swcmb/Nebula-Zero/issues/new?template=account-application.yml
-    about: 申请模型调用账号，需要能在本站注册并收信
+blank_issues_enabled: true
